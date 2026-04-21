@@ -8,6 +8,7 @@ from docx.table import _Cell, Table
 from docx.text.paragraph import Paragraph
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import io
@@ -507,10 +508,27 @@ def _format_question_heading(qid, body_text):
     return f"{qid}. {body}"
 
 
+def _set_table_width_percent(table, pct_fiftieths):
+    """pct_fiftieths: 5000 = 100% of parent (Word ``pct`` width)."""
+    tbl = table._tbl
+    tbl_pr = tbl.tblPr
+    if tbl_pr is None:
+        tbl_pr = OxmlElement("w:tblPr")
+        tbl.insert(0, tbl_pr)
+    for child in list(tbl_pr):
+        if child.tag == qn("w:tblW"):
+            tbl_pr.remove(child)
+    tbl_w = OxmlElement("w:tblW")
+    tbl_w.set(qn("w:type"), "pct")
+    tbl_w.set(qn("w:w"), str(pct_fiftieths))
+    tbl_pr.append(tbl_w)
+
+
 def _add_nested_answer_table(cell, answers, use_primary_text):
     """
     Nested 3-column table: index | label | (empty), like the reference layout.
     Rows follow the primary (English) answer list so left/right stay aligned.
+    Table is ~full width of the cell and centered.
     """
     leaders = [a for a in answers if (a.get("primary") or "").strip()]
     if not leaders:
@@ -518,6 +536,10 @@ def _add_nested_answer_table(cell, answers, use_primary_text):
         return
     nt = cell.add_table(rows=len(leaders), cols=3)
     nt.style = "Table Grid"
+    nt.autofit = False
+    nt.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _set_table_width_percent(nt, 4800)
+
     for ri, ans in enumerate(leaders):
         num = (ans.get("number") or "").strip() or str(ri + 1)
         if use_primary_text:
@@ -532,8 +554,9 @@ def _add_nested_answer_table(cell, answers, use_primary_text):
             for para in c.paragraphs:
                 for run in para.runs:
                     run.font.size = Pt(9)
-        row.cells[0].width = Inches(0.38)
-        row.cells[2].width = Inches(0.28)
+        row.cells[0].width = Inches(0.42)
+        row.cells[1].width = Inches(2.85)
+        row.cells[2].width = Inches(0.38)
 
 
 def generate_docx(merged, primary_label, secondary_label):
@@ -614,7 +637,7 @@ def generate_docx(merged, primary_label, secondary_label):
                         run.font.size = Pt(9)
             continue
 
-        # Questions (XML tags or DOCX): heading row + spacer + one row with nested option tables
+        # Questions: heading row, then next row = nested option tables (no spacer row)
         qid = str(item.get("id", ""))
         answers = item.get("answers") or []
         prim = (item.get("primary") or "").strip()
@@ -636,13 +659,6 @@ def generate_docx(merged, primary_label, secondary_label):
                     run.font.size = Pt(10)
 
         if has_answers:
-            gap = table.add_row()
-            for c in gap.cells:
-                c.text = "\u00a0"
-                for para in c.paragraphs:
-                    for run in para.runs:
-                        run.font.size = Pt(4)
-
             opt_row = table.add_row()
             oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
             for c in (oc0, oc1):
