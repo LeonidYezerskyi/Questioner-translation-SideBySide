@@ -495,6 +495,47 @@ def set_col_width(table, col_index, width_inches):
     for row in table.rows:
         row.cells[col_index].width = Inches(width_inches)
 
+
+def _format_question_heading(qid, body_text):
+    """Same style as reference: ``S4. Question text`` in both language columns."""
+    qid = (qid or "").strip()
+    body = (body_text or "").strip()
+    if not qid:
+        return body
+    if not body:
+        return f"{qid}."
+    return f"{qid}. {body}"
+
+
+def _add_nested_answer_table(cell, answers, use_primary_text):
+    """
+    Nested 3-column table: index | label | (empty), like the reference layout.
+    Rows follow the primary (English) answer list so left/right stay aligned.
+    """
+    leaders = [a for a in answers if (a.get("primary") or "").strip()]
+    if not leaders:
+        cell.text = ""
+        return
+    nt = cell.add_table(rows=len(leaders), cols=3)
+    nt.style = "Table Grid"
+    for ri, ans in enumerate(leaders):
+        num = (ans.get("number") or "").strip() or str(ri + 1)
+        if use_primary_text:
+            label = (ans.get("primary") or "").strip()
+        else:
+            label = (ans.get("secondary") or "").strip()
+        row = nt.rows[ri]
+        row.cells[0].text = num
+        row.cells[1].text = label
+        row.cells[2].text = ""
+        for c in row.cells:
+            for para in c.paragraphs:
+                for run in para.runs:
+                    run.font.size = Pt(9)
+        row.cells[0].width = Inches(0.38)
+        row.cells[2].width = Inches(0.28)
+
+
 def generate_docx(merged, primary_label, secondary_label):
     """Generate bilingual DOCX from merged data."""
     doc = Document()
@@ -573,40 +614,41 @@ def generate_docx(merged, primary_label, secondary_label):
                         run.font.size = Pt(9)
             continue
 
-        # Question row
-        if item['primary']:
-            row = table.add_row()
-            cells = row.cells
-            q_text_en = f"[{item['id']}]  {item['primary']}"
-            q_text_tr = item['secondary'] if item['secondary'] else ''
-            cells[0].text = q_text_en
-            cells[1].text = q_text_tr
-            set_cell_bg(cells[0], 'EBF5FB')
-            set_cell_bg(cells[1], 'EBF5FB')
-            for cell in cells:
-                for para in cell.paragraphs:
+        # Questions (XML tags or DOCX): heading row + spacer + one row with nested option tables
+        qid = str(item.get("id", ""))
+        answers = item.get("answers") or []
+        prim = (item.get("primary") or "").strip()
+        sec = (item.get("secondary") or "").strip()
+        has_answers = any((a.get("primary") or "").strip() for a in answers)
+
+        if not prim and not has_answers:
+            continue
+
+        qrow = table.add_row()
+        qc = qrow.cells
+        qc[0].text = _format_question_heading(qid, prim) if prim else f"{qid}."
+        qc[1].text = _format_question_heading(qid, sec) if sec else f"{qid}."
+        for cell in qc:
+            set_cell_bg(cell, "EBF5FB")
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.bold = True
+                    run.font.size = Pt(10)
+
+        if has_answers:
+            gap = table.add_row()
+            for c in gap.cells:
+                c.text = "\u00a0"
+                for para in c.paragraphs:
                     for run in para.runs:
-                        run.bold = True
-                        run.font.size = Pt(10)
+                        run.font.size = Pt(4)
 
-        # Answer rows
-        for ans in item['answers']:
-            if not ans['primary']:
-                continue
-
-            row = table.add_row()
-            cells = row.cells
-
-            prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
-            num = ans.get('number', '')
-
-            cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
-            cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
-
-            for cell in cells:
-                for para in cell.paragraphs:
-                    for run in para.runs:
-                        run.font.size = Pt(9)
+            opt_row = table.add_row()
+            oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
+            for c in (oc0, oc1):
+                set_cell_bg(c, "FFFFFF")
+            _add_nested_answer_table(oc0, answers, True)
+            _add_nested_answer_table(oc1, answers, False)
 
     for row in table.rows:
         for cell in row.cells:
