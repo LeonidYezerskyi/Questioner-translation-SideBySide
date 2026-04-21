@@ -1,6 +1,11 @@
 import streamlit as st
 import xml.etree.ElementTree as ET
 from docx import Document
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import _Cell, Table
+from docx.text.paragraph import Paragraph
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
@@ -11,80 +16,150 @@ import os
 import tempfile
 import re
 
-def _row_text(cells):
-    """First non-empty cell, or joined non-empty texts (common in multi-column layouts)."""
-    parts = [c.text.strip() for c in cells if c.text and c.text.strip()]
-    if not parts:
-        return ""
-    if len(parts) == 1:
-        return parts[0]
-    return parts[0]
+def _iter_block_items(parent):
+    """Walk body in document order (paragraphs and tables interleaved)."""
+    if isinstance(parent, DocxDocument):
+        body = parent.element.body
+    elif isinstance(parent, _Cell):
+        body = parent._tc
+    else:
+        return
+    for child in body.iterchildren():
+        if isinstance(child, CT_P):
+            yield ("p", Paragraph(child, parent))
+        elif isinstance(child, CT_Tbl):
+            yield ("t", Table(child, parent))
 
-def _match_question_line(txt):
-    """
-    Try several patterns so typical Word questionnaires parse (IDs must match across EN/UA files).
-    """
-    # Q1: text, H2a. text, AE12) text
-    m = re.match(r"^([A-Za-z]+\d+[A-Za-z0-9.\-]*)\s*[:.\)]\s*(.+)$", txt, re.DOTALL)
-    if m:
-        return m.group(1).upper(), m.group(2).strip()
-    # 1. text or 1) text  -> stable id NUM_1 across languages if numbering matches
-    m = re.match(r"^(\d+)\s*[:.\)]\s+(.+)$", txt, re.DOTALL)
-    if m:
-        return f"NUM_{m.group(1)}", m.group(2).strip()
-    # Q1    text (tab or 2+ spaces, no colon — common in pasted Word tables)
-    m = re.match(r"^([A-Za-z]+\d+[A-Za-z0-9.\-]*)[\t ]{2,}(.+)$", txt, re.DOTALL)
-    if m:
-        return m.group(1).upper(), m.group(2).strip()
-    m = re.match(r"^(\d+)[\t ]{2,}(.+)$", txt, re.DOTALL)
-    if m:
-        return f"NUM_{m.group(1)}", m.group(2).strip()
-    return None, None
 
-def _parse_docx_lines(lines_iter, items, current_section, current_question):
-    """Shared line parser for table rows and body paragraphs."""
-    for txt in lines_iter:
-        txt = txt.strip()
-        if not txt:
+_RE_DOCX_Q = re.compile(
+    r"^([A-Za-z]+\d+[a-zA-Z]*)\s*[:.]\s*(.+)$",
+    re.DOTALL,
+)
+_META_LINE_PREFIXES = (
+    "Q Type:",
+    "Rotate/Randomize:",
+    "Programmer notes:",
+    "Тип запитання:",
+    "Ротація/Рандомізація:",
+    "Примітки програміста:",
+)
+
+
+def _docx_is_meta_line(txt):
+    t = txt.strip()
+    return any(t.startswith(p) for p in _META_LINE_PREFIXES)
+
+
+def _docx_looks_like_section(txt):
+    t = txt.strip()
+    if _docx_is_meta_line(t) or _RE_DOCX_Q.match(t):
+        return False
+    if len(t) < 4 or len(t) > 140:
+        return False
+    if re.match(r"^Part\s+[A-Z]\.", t):
+        return True
+    letters = [c for c in t if c.isalpha()]
+    if len(letters) < 4:
+        return False
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    return upper_ratio >= 0.72
+
+
+def _docx_table_to_answers(qid, table):
+    answers = []
+    for row in table.rows:
+        if not row.cells:
             continue
-
-        if txt.isupper() and len(txt) < 120:
-            current_section = txt
-            items.append({
-                "id": current_section,
-                "type": "section",
-                "sectionId": current_section,
-                "text": txt,
-                "answers": []
-            })
-            current_question = None
+        code = row.cells[0].text.strip()
+        label = (
+            row.cells[1].text.replace("\n", " ").strip()
+            if len(row.cells) > 1
+            else ""
+        )
+        if not code and not label:
             continue
-
-        qid, qtext = _match_question_line(txt)
-        if qid:
-            current_question = {
-                "id": qid,
-                "type": "question",
-                "sectionId": current_section,
-                "text": qtext,
-                "answers": []
-            }
-            items.append(current_question)
-            continue
-
-        m2 = re.match(r"^(\d+)\s+(.+)$", txt, re.DOTALL)
-        if m2 and current_question:
-            current_question["answers"].append({
-                "id": f"{current_question['id']}_{m2.group(1)}",
+        if re.match(r"^[\d\-]+$", code):
+            answers.append({
+                "id": f"{qid}_{code}",
                 "role": "row",
-                "number": m2.group(1),
-                "text": m2.group(2).strip()
+                "number": code,
+                "text": label,
             })
-            continue
+    return answers
 
-    return current_section, current_question
+
+def _docx_flush_question_buffer(current_q, buf):
+    """Turn queued paragraphs/tables after a question header into stem text + answers."""
+    if not current_q or not buf:
+        return
+
+    while buf and buf[0][0] == "p" and _docx_is_meta_line(buf[0][1]):
+        buf.pop(0)
+    while buf and buf[-1][0] == "p" and _docx_is_meta_line(buf[-1][1]):
+        buf.pop()
+    if not buf:
+        return
+
+    has_table = any(k == "t" for k, _ in buf)
+
+    if has_table:
+        stem_parts = []
+        for k, d in buf:
+            if k == "p" and not _docx_is_meta_line(d):
+                stem_parts.append(d.strip())
+            elif k == "t":
+                break
+        current_q["text"] = "\n".join(stem_parts).strip()
+        for k, d in buf:
+            if k == "t":
+                current_q["answers"].extend(_docx_table_to_answers(current_q["id"], d))
+        return
+
+    split_at = None
+    for i, (k, t) in enumerate(buf):
+        if k == "p" and _docx_is_meta_line(t):
+            split_at = i
+            break
+
+    texts = [d.strip() for k, d in buf if k == "p" and not _docx_is_meta_line(d)]
+
+    if split_at is None:
+        if len(buf) <= 5:
+            current_q["text"] = "\n".join(texts).strip()
+            return
+        if texts:
+            current_q["text"] = texts[0]
+            for j, ot in enumerate(texts[1:], 1):
+                current_q["answers"].append({
+                    "id": f"{current_q['id']}_{j}",
+                    "role": "row",
+                    "number": str(j),
+                    "text": ot,
+                })
+        return
+
+    pre_texts = [
+        d.strip()
+        for k, d in buf[:split_at]
+        if k == "p" and not _docx_is_meta_line(d)
+    ]
+    if not pre_texts:
+        return
+    current_q["text"] = pre_texts[0]
+    for j, ot in enumerate(pre_texts[1:], 1):
+        current_q["answers"].append({
+            "id": f"{current_q['id']}_{j}",
+            "role": "row",
+            "number": str(j),
+            "text": ot,
+        })
+
 
 def parse_docx(file_bytes):
+    """
+    Parse script-style questionnaires: question lines like ``S1: …`` or ``D4a. …``,
+    tables with coded rows, and paragraph option lists (EN/UA use the same question IDs).
+    """
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
@@ -94,31 +169,56 @@ def parse_docx(file_bytes):
         doc = Document(tmp_path)
 
         items = []
-        current_section = "default"
-        current_question = None
+        sec_idx = 0
+        section_id = "SEC_0"
+        current_q = None
+        buf = []
 
-        def table_lines():
-            for table in doc.tables:
-                for row in table.rows:
-                    if not row.cells:
-                        continue
-                    t = _row_text(row.cells)
-                    if t:
-                        yield t
+        for kind, item in _iter_block_items(doc):
+            if kind == "p":
+                t = item.text.strip()
+                if not t:
+                    continue
 
-        current_section, current_question = _parse_docx_lines(
-            table_lines(), items, current_section, current_question
-        )
+                if _docx_looks_like_section(t):
+                    _docx_flush_question_buffer(current_q, buf)
+                    buf = []
+                    current_q = None
+                    sid = f"SEC_{sec_idx}"
+                    sec_idx += 1
+                    section_id = sid
+                    items.append({
+                        "id": sid,
+                        "type": "section",
+                        "sectionId": sid,
+                        "text": t,
+                        "answers": [],
+                    })
+                    continue
 
-        if not items:
-            def para_lines():
-                for para in doc.paragraphs:
-                    if para.text and para.text.strip():
-                        yield para.text
+                m = _RE_DOCX_Q.match(t)
+                if m:
+                    _docx_flush_question_buffer(current_q, buf)
+                    buf = []
+                    qid = m.group(1)
+                    title = m.group(2).strip()
+                    current_q = {
+                        "id": qid,
+                        "type": "question",
+                        "sectionId": section_id,
+                        "text": title,
+                        "answers": [],
+                    }
+                    items.append(current_q)
+                    continue
 
-            current_section, current_question = _parse_docx_lines(
-                para_lines(), items, current_section, current_question
-            )
+                if current_q:
+                    buf.append(("p", t))
+            else:
+                if current_q:
+                    buf.append(("t", item))
+
+        _docx_flush_question_buffer(current_q, buf)
 
         return items
     finally:
@@ -140,7 +240,11 @@ def parse_file(uploaded_file):
     raise Exception("Unsupported file type")
 st.set_page_config(page_title="Survey Bilingual Generator", layout="centered")
 st.title("📋 Survey Bilingual Document Generator")
-st.markdown("Upload two XML survey files to generate a bilingual side-by-side DOCX.")
+st.markdown(
+    "Завантажте два файли опитування (**XML** або **DOCX**): перший — основна мова, "
+    "другий — переклад. Для Word очікується структура як у скрипті (рядки **S1:**, **D4a.** тощо, "
+    "таблиці з кодами у першій колонці або списки варіантів до наступного питання)."
+)
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -438,10 +542,10 @@ if primary_file and secondary_file:
 
                 if len(merged) == 0:
                     st.warning(
-                        "No items were parsed from the DOCX/XML files. "
-                        "Expected sections (short ALL-CAPS lines), questions like "
-                        "`Q1: text` or `1. text`, and answer lines `1 answer text`. "
-                        "If your Word file uses a different layout, try exporting survey XML instead."
+                        "Не вдалося розпізнати структуру DOCX/XML. "
+                        "Для Word: питання як **S1: …** або **D4a. …**, секції — переважно ВЕЛИКИМИ ЛІТЕРАМИ, "
+                        "варіанти — абзаци до «Q Type» / «Rotate» або рядки таблиці «код | текст». "
+                        "Спробуйте експорт у XML, якщо макет інший."
                     )
 
                 with st.expander("Preview merged data (first 10 items)"):
