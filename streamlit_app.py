@@ -7,7 +7,78 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import io
 import json
+from docx import Document
+import tempfile
+import re
 
+def parse_docx(file_bytes):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    doc = Document(tmp_path)
+
+    items = []
+    current_section = "default"
+
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+
+        if not txt:
+            continue
+
+        # Section headers
+        if txt.isupper() and len(txt) < 120:
+            current_section = txt
+
+            items.append({
+                "id": current_section,
+                "type": "section",
+                "sectionId": current_section,
+                "text": txt,
+                "answers": []
+            })
+
+            continue
+
+        # Question detection
+        m = re.match(r'^([A-Z]+\d+[\.\w]*):?\s+(.*)', txt)
+
+        if m:
+            qid = m.group(1)
+            qtext = m.group(2)
+
+            items.append({
+                "id": qid,
+                "type": "question",
+                "sectionId": current_section,
+                "text": qtext,
+                "answers": []
+            })
+
+            continue
+
+        # Fallback textblock
+        items.append({
+            "id": f"text_{len(items)}",
+            "type": "textblock",
+            "sectionId": current_section,
+            "text": txt,
+            "answers": []
+        })
+
+    return items
+
+def parse_file(uploaded_file):
+    ext = uploaded_file.name.lower().split('.')[-1]
+
+    if ext == "xml":
+        return parse_xml(uploaded_file.read())
+
+    if ext == "docx":
+        return parse_docx(uploaded_file.read())
+
+    raise Exception("Unsupported file type")
 st.set_page_config(page_title="Survey Bilingual Generator", layout="centered")
 st.title("📋 Survey Bilingual Document Generator")
 st.markdown("Upload two XML survey files to generate a bilingual side-by-side DOCX.")
@@ -264,17 +335,23 @@ def generate_docx(merged, primary_label, secondary_label):
 col1, col2 = st.columns(2)
 with col1:
     primary_label = st.text_input("Primary language label", value="English")
-    primary_file = st.file_uploader("Upload Primary XML (e.g. EN)", type=['xml'])
+   primary_file = st.file_uploader(
+    "Upload Primary file",
+    type=['xml','docx']
+)
 with col2:
     secondary_label = st.text_input("Secondary language label", value="Translation")
-    secondary_file = st.file_uploader("Upload Secondary XML (translation)", type=['xml'])
+    secondary_file = st.file_uploader(
+    "Upload Secondary file",
+    type=['xml','docx']
+)
 
 if primary_file and secondary_file:
     if st.button("🚀 Generate Bilingual DOCX", type="primary"):
         with st.spinner("Parsing and merging..."):
             try:
-                primary_items = parse_xml(primary_file.read())
-                secondary_items = parse_xml(secondary_file.read())
+                primary_items = parse_file(primary_file)
+secondary_items = parse_file(secondary_file)
                 merged = merge(primary_items, secondary_items)
 
                 st.success(f"✅ Merged {len(merged)} items successfully")
