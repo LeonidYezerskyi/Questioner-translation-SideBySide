@@ -13,6 +13,7 @@ from docx.oxml import OxmlElement
 import io
 import json
 import os
+from collections import deque
 import tempfile
 import re
 
@@ -342,6 +343,105 @@ def parse_xml(xml_bytes):
 
     return items
 
+def _answer_code_from_primary_row(ans):
+    """Numeric code from table column or from id suffix (e.g. S1_37 -> 37)."""
+    num = (ans.get('number') or '').strip()
+    if num and re.match(r'^[\d\-]+$', num):
+        return num
+    aid = ans.get('id', '')
+    if '_' in aid:
+        suf = aid.rsplit('_', 1)[-1]
+        if re.match(r'^[\d\-]+$', suf):
+            return suf
+    return ''
+
+def _leading_numbered_code_in_text(text):
+    """UA sometimes keeps script code as ``37. text`` — align to EN row code 37."""
+    m = re.match(r'^\s*(\d+)\s*[).:]\s+', text or '')
+    if m:
+        return m.group(1)
+    return None
+
+def _collapse_bracket_option_runs(texts):
+    """
+    Merge consecutive short options that start with '[' (split Show/Показувати lines)
+    so two EN table rows map to two combined UA blocks instead of four UA lines.
+    """
+    out = []
+    i = 0
+    while i < len(texts):
+        t = (texts[i] or '').strip()
+        if i + 1 < len(texts):
+            u = (texts[i + 1] or '').strip()
+            if t.startswith('[') and u.startswith('['):
+                out.append(texts[i].rstrip() + '\n' + texts[i + 1].rstrip())
+                i += 2
+                continue
+        out.append(texts[i])
+        i += 1
+    return out
+
+def _merge_answer_lists_aligned(primary_answers, secondary_answers):
+    """
+    Pair EN/UA answer rows for DOCX where ids are ordinal on one side and coded on the other.
+    Uses: (1) explicit numbers at start of UA line -> EN code; (2) merge consecutive '[' lines;
+    (3) FIFO for remaining rows in document order.
+    """
+    if not primary_answers:
+        return []
+    if not secondary_answers:
+        return [
+            {
+                'id': a['id'],
+                'role': a['role'],
+                'number': a.get('number', ''),
+                'primary': a['text'],
+                'secondary': '',
+            }
+            for a in primary_answers
+        ]
+
+    sec_texts = [a.get('text', '') for a in secondary_answers]
+    keyed = {}
+    non_keyed = []
+    for t in sec_texts:
+        code = _leading_numbered_code_in_text(t)
+        if code is not None:
+            keyed[code] = t.strip()
+        else:
+            non_keyed.append(t)
+    non_keyed = _collapse_bracket_option_runs(non_keyed)
+    plain = deque(non_keyed)
+    used_keyed = set()
+
+    rows = []
+    for pa in primary_answers:
+        code = _answer_code_from_primary_row(pa)
+        sec = ''
+        if code and code in keyed and code not in used_keyed:
+            sec = keyed[code]
+            used_keyed.add(code)
+        elif plain:
+            sec = plain.popleft().strip()
+        rows.append({
+            'id': pa['id'],
+            'role': pa.get('role', 'row'),
+            'number': pa.get('number', ''),
+            'primary': pa['text'],
+            'secondary': sec,
+        })
+    return rows
+
+def _answers_merge_by_ids_ok(primary_answers, secondary_answers):
+    """True when ids line up (same count + almost every id has non-empty secondary text)."""
+    if not primary_answers:
+        return True
+    if len(primary_answers) != len(secondary_answers):
+        return False
+    sm = {a['id']: a.get('text', '') for a in secondary_answers}
+    hits = sum(1 for a in primary_answers if sm.get(a['id'], '').strip())
+    return hits / len(primary_answers) >= 0.92
+
 def merge(primary_items, secondary_items):
     """Merge primary and secondary by ID."""
     secondary_map = {item['id']: item for item in secondary_items}
@@ -353,22 +453,30 @@ def merge(primary_items, secondary_items):
     merged = []
     for p_item in primary_items:
         s_item = secondary_map.get(p_item['id'])
+        pa = p_item.get('answers', [])
+        sa = s_item.get('answers', []) if s_item else []
+
+        if pa and sa and not _answers_merge_by_ids_ok(pa, sa):
+            merged_ans = _merge_answer_lists_aligned(pa, sa)
+        else:
+            merged_ans = [
+                {
+                    'id': a['id'],
+                    'role': a['role'],
+                    'number': a.get('number', ''),
+                    'primary': a['text'],
+                    'secondary': secondary_answer_map.get(a['id'], ''),
+                }
+                for a in pa
+            ]
+
         merged.append({
             'id': p_item['id'],
             'type': p_item['type'],
             'sectionId': p_item['sectionId'],
             'primary': p_item['text'],
             'secondary': s_item['text'] if s_item else '',
-            'answers': [
-                {
-                    'id': a['id'],
-                    'role': a['role'],
-                    'number': a.get('number',''),
-                    'primary': a['text'],
-                    'secondary': secondary_answer_map.get(a['id'], '')
-                }
-                for a in p_item.get('answers', [])
-            ]
+            'answers': merged_ans,
         })
     return merged
 
@@ -427,15 +535,26 @@ def generate_docx(merged, primary_label, secondary_label):
         if item['type'] == 'section':
             row = table.add_row()
             cells = row.cells
-            # Merge cells for section header
-            cells[0].merge(cells[1])
-            cells[0].text = f"  {item['primary'].upper()}"
-            set_cell_bg(cells[0], '1ABC9C')
-            for para in cells[0].paragraphs:
-                for run in para.runs:
-                    run.bold = True
-                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                    run.font.size = Pt(10)
+            sec = (item.get('secondary') or '').strip()
+            if sec:
+                cells[0].text = f"  {item['primary'].upper()}"
+                cells[1].text = f"  {sec.upper()}"
+                for cell in cells:
+                    set_cell_bg(cell, '1ABC9C')
+                    for para in cell.paragraphs:
+                        for run in para.runs:
+                            run.bold = True
+                            run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                            run.font.size = Pt(10)
+            else:
+                cells[0].merge(cells[1])
+                cells[0].text = f"  {item['primary'].upper()}"
+                set_cell_bg(cells[0], '1ABC9C')
+                for para in cells[0].paragraphs:
+                    for run in para.runs:
+                        run.bold = True
+                        run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
+                        run.font.size = Pt(10)
             continue
 
         if item['type'] == 'textblock':
