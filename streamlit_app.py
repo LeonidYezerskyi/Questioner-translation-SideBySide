@@ -330,7 +330,7 @@ def generate_docx(merged, primary_label, secondary_label):
                         run.bold = True
                         run.font.size = Pt(10)
 
-        # Answer rows
+      # Answer rows
 for ans in item['answers']:
     if not ans['primary']:
         continue
@@ -339,16 +339,16 @@ for ans in item['answers']:
     cells = row.cells
 
     prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
-
-    num = ans.get('number','')
+    num = ans.get('number', '')
 
     cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
     cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
-            for cell in cells:
-                for para in cell.paragraphs:
-                    for run in para.runs:
-                        run.font.size = Pt(9)
 
+    for cell in cells:
+        for para in cell.paragraphs:
+            for run in para.runs:
+                run.font.size = Pt(9)
+                
     # Set column widths
     for row in table.rows:
         for i, cell in enumerate(row.cells):
