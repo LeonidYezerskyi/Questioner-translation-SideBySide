@@ -9,6 +9,7 @@ from docx.text.paragraph import Paragraph
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import io
@@ -524,9 +525,9 @@ def _set_table_width_percent(table, pct_fiftieths):
     tbl_pr.append(tbl_w)
 
 
-def _add_nested_answer_table(cell, answers, use_primary_text):
+def _add_nested_answer_table(cell, answers, use_primary_text, label_column_width=None):
     """
-    Nested 3-column table: index | label | (empty), like the reference layout.
+    Nested 2-column table: index | label.
     Rows follow the primary (English) answer list so left/right stay aligned.
     Table is ~full width of the cell and centered.
     """
@@ -534,11 +535,17 @@ def _add_nested_answer_table(cell, answers, use_primary_text):
     if not leaders:
         cell.text = ""
         return
-    nt = cell.add_table(rows=len(leaders), cols=3)
+    nt = cell.add_table(rows=len(leaders), cols=2)
     nt.style = "Table Grid"
     nt.autofit = False
     nt.alignment = WD_TABLE_ALIGNMENT.CENTER
     _set_table_width_percent(nt, 4800)
+
+    idx_w = Inches(0.52)
+    if label_column_width is not None:
+        lbl_w = Inches(max(1.8, label_column_width.inches - idx_w.inches))
+    else:
+        lbl_w = Inches(3.0)
 
     for ri, ans in enumerate(leaders):
         num = (ans.get("number") or "").strip() or str(ri + 1)
@@ -549,26 +556,33 @@ def _add_nested_answer_table(cell, answers, use_primary_text):
         row = nt.rows[ri]
         row.cells[0].text = num
         row.cells[1].text = label
-        row.cells[2].text = ""
         for c in row.cells:
             for para in c.paragraphs:
                 for run in para.runs:
                     run.font.size = Pt(9)
-        row.cells[0].width = Inches(0.42)
-        row.cells[1].width = Inches(2.85)
-        row.cells[2].width = Inches(0.38)
+        row.cells[0].width = idx_w
+        row.cells[1].width = lbl_w
 
 
 def generate_docx(merged, primary_label, secondary_label):
     """Generate bilingual DOCX from merged data."""
     doc = Document()
 
-    # Page margins
+    # Page: landscape (wider columns for two languages)
     section = doc.sections[0]
     section.left_margin = Inches(0.7)
     section.right_margin = Inches(0.7)
     section.top_margin = Inches(0.7)
     section.bottom_margin = Inches(0.7)
+    new_width, new_height = section.page_height, section.page_width
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width = new_width
+    section.page_height = new_height
+
+    col_half = Inches(
+        (section.page_width.inches - section.left_margin.inches - section.right_margin.inches)
+        / 2.0
+    )
 
     # Title
     title = doc.add_heading('Bilingual Survey Document', level=1)
@@ -663,12 +677,12 @@ def generate_docx(merged, primary_label, secondary_label):
             oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
             for c in (oc0, oc1):
                 set_cell_bg(c, "FFFFFF")
-            _add_nested_answer_table(oc0, answers, True)
-            _add_nested_answer_table(oc1, answers, False)
+            _add_nested_answer_table(oc0, answers, True, col_half)
+            _add_nested_answer_table(oc1, answers, False, col_half)
 
     for row in table.rows:
         for cell in row.cells:
-            cell.width = Inches(3.8)
+            cell.width = col_half
 
     buf = io.BytesIO()
     doc.save(buf)
