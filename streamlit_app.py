@@ -12,6 +12,7 @@ import tempfile
 import re
 
 def parse_docx(file_bytes):
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -20,52 +21,74 @@ def parse_docx(file_bytes):
 
     items = []
     current_section = "default"
+    current_question = None
 
-    for p in doc.paragraphs:
-        txt = p.text.strip()
+    # -------- TABLES FIRST --------
 
-        if not txt:
-            continue
+    for table in doc.tables:
 
-        # Section headers
-        if txt.isupper() and len(txt) < 120:
-            current_section = txt
+        for row in table.rows:
 
-            items.append({
-                "id": current_section,
-                "type": "section",
-                "sectionId": current_section,
-                "text": txt,
-                "answers": []
-            })
+            cells = row.cells
 
-            continue
+            if len(cells) == 0:
+                continue
 
-        # Question detection
-        m = re.match(r'^([A-Z]+\d+[\.\w]*):?\s+(.*)', txt)
+            txt = cells[0].text.strip()
 
-        if m:
-            qid = m.group(1)
-            qtext = m.group(2)
+            if not txt:
+                continue
 
-            items.append({
-                "id": qid,
-                "type": "question",
-                "sectionId": current_section,
-                "text": qtext,
-                "answers": []
-            })
+            # SECTION
+            if txt.isupper() and len(txt) < 120:
 
-            continue
+                current_section = txt
 
-        # Fallback textblock
-        items.append({
-            "id": f"text_{len(items)}",
-            "type": "textblock",
-            "sectionId": current_section,
-            "text": txt,
-            "answers": []
-        })
+                items.append({
+                    "id": current_section,
+                    "type": "section",
+                    "sectionId": current_section,
+                    "text": txt,
+                    "answers": []
+                })
+
+                continue
+
+
+            # QUESTION
+            m = re.match(r'^([A-Z]+\d+[\.\w]*):?\s+(.*)', txt)
+
+            if m:
+                qid = m.group(1)
+                qtext = m.group(2)
+
+                current_question = {
+                    "id": qid,
+                    "type": "question",
+                    "sectionId": current_section,
+                    "text": qtext,
+                    "answers": []
+                }
+
+                items.append(current_question)
+
+                continue
+
+
+            # ANSWER ROW
+            m2 = re.match(r'^(\d+)\s+(.*)', txt)
+
+            if m2 and current_question:
+
+                current_question["answers"].append({
+                    "id": f"{current_question['id']}_{m2.group(1)}",
+                    "role": "row",
+                    "number": m2.group(1),
+                    "text": m2.group(2)
+                })
+
+                continue
+
 
     return items
 
@@ -200,6 +223,7 @@ def merge(primary_items, secondary_items):
                 {
                     'id': a['id'],
                     'role': a['role'],
+                    'number': a.get('number',''),
                     'primary': a['text'],
                     'secondary': secondary_answer_map.get(a['id'], '')
                 }
@@ -307,14 +331,19 @@ def generate_docx(merged, primary_label, secondary_label):
                         run.font.size = Pt(10)
 
         # Answer rows
-        for ans in item['answers']:
-            if not ans['primary']:
-                continue
-            row = table.add_row()
-            cells = row.cells
-            prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
-            cells[0].text = prefix + ans['primary']
-            cells[1].text = ans['secondary'] if ans['secondary'] else ''
+for ans in item['answers']:
+    if not ans['primary']:
+        continue
+
+    row = table.add_row()
+    cells = row.cells
+
+    prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
+
+    num = ans.get('number','')
+
+    cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
+    cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
             for cell in cells:
                 for para in cell.paragraphs:
                     for run in para.runs:
