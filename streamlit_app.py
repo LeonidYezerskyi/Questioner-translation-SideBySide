@@ -329,35 +329,35 @@ def generate_docx(merged, primary_label, secondary_label):
                     for run in para.runs:
                         run.bold = True
                         run.font.size = Pt(10)
-
-      # Answer rows
-    for ans in item['answers']:
-        if not ans['primary']:
-            continue
-            
-        row = table.add_row()
-        cells = row.cells
-        
-        prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
-        num = ans.get('number', '')
-        
-        cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
-        cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
-        
-        for cell in cells:
-            for para in cell.paragraphs:
-                for run in para.runs:
-                    run.font.size = Pt(9)
-                    
-    # Set column widths
-        for row in table.rows:
-            for i, cell in enumerate(row.cells):
-                cell.width = Inches(3.8)
+                        
+        # Answer rows
+        for ans in item['answers']:
+            if not ans['primary']:
+                continue
                 
-            buf = io.BytesIO()
-            doc.save(buf)
-            buf.seek(0)
-            return buf
+            row = table.add_row()
+            cells = row.cells
+            
+            prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
+            num = ans.get('number', '')
+            
+            cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
+            cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
+            
+            for cell in cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        run.font.size = Pt(9)
+                    
+        # Set column widths
+            for row in table.rows:
+                for i, cell in enumerate(row.cells):
+                    cell.width = Inches(3.8)
+                    
+                buf = io.BytesIO()
+                doc.save(buf)
+                buf.seek(0)
+                return buf
 
 # ── UI ─────────────────────────────────────────
 
