@@ -330,38 +330,57 @@ def generate_docx(merged, primary_label, secondary_label):
     buf.seek(0)
     return buf
 
-# ── UI ───────────────────────────────────────────────────────────────────────
+# ── UI ─────────────────────────────────────────
 
 col1, col2 = st.columns(2)
+
 with col1:
-    primary_label = st.text_input("Primary language label", value="English")
-   primary_file = st.file_uploader(
-    "Upload Primary file",
-    type=['xml','docx']
-)
+    primary_label = st.text_input(
+        "Primary language label",
+        value="English"
+    )
+
+    primary_file = st.file_uploader(
+        "Upload Primary file",
+        type=['xml', 'docx']
+    )
+
 with col2:
-    secondary_label = st.text_input("Secondary language label", value="Translation")
+    secondary_label = st.text_input(
+        "Secondary language label",
+        value="Translation"
+    )
+
     secondary_file = st.file_uploader(
-    "Upload Secondary file",
-    type=['xml','docx']
-)
+        "Upload Secondary file",
+        type=['xml', 'docx']
+    )
 
 if primary_file and secondary_file:
+
     if st.button("🚀 Generate Bilingual DOCX", type="primary"):
+
         with st.spinner("Parsing and merging..."):
+
             try:
                 primary_items = parse_file(primary_file)
-secondary_items = parse_file(secondary_file)
+                secondary_items = parse_file(secondary_file)
+
                 merged = merge(primary_items, secondary_items)
 
-                st.success(f"✅ Merged {len(merged)} items successfully")
+                st.success(
+                    f"✅ Merged {len(merged)} items successfully"
+                )
 
-                # Preview
                 with st.expander("Preview merged data (first 10 items)"):
                     st.json(merged[:10])
 
                 with st.spinner("Generating DOCX..."):
-                    docx_buf = generate_docx(merged, primary_label, secondary_label)
+                    docx_buf = generate_docx(
+                        merged,
+                        primary_label,
+                        secondary_label
+                    )
 
                 st.download_button(
                     label="📥 Download DOCX",
@@ -373,5 +392,6 @@ secondary_items = parse_file(secondary_file)
             except Exception as e:
                 st.error(f"Error: {str(e)}")
                 st.exception(e)
+
 else:
-    st.info("👆 Upload both XML files to get started.")
+    st.info("👆 Upload both files to get started.")
