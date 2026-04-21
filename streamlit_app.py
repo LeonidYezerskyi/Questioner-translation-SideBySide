@@ -7,90 +7,126 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 import io
 import json
-from docx import Document
+import os
 import tempfile
 import re
 
+def _row_text(cells):
+    """First non-empty cell, or joined non-empty texts (common in multi-column layouts)."""
+    parts = [c.text.strip() for c in cells if c.text and c.text.strip()]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return parts[0]
+
+def _match_question_line(txt):
+    """
+    Try several patterns so typical Word questionnaires parse (IDs must match across EN/UA files).
+    """
+    # Q1: text, H2a. text, AE12) text
+    m = re.match(r"^([A-Za-z]+\d+[A-Za-z0-9.\-]*)\s*[:.\)]\s*(.+)$", txt, re.DOTALL)
+    if m:
+        return m.group(1).upper(), m.group(2).strip()
+    # 1. text or 1) text  -> stable id NUM_1 across languages if numbering matches
+    m = re.match(r"^(\d+)\s*[:.\)]\s+(.+)$", txt, re.DOTALL)
+    if m:
+        return f"NUM_{m.group(1)}", m.group(2).strip()
+    # Q1    text (tab or 2+ spaces, no colon — common in pasted Word tables)
+    m = re.match(r"^([A-Za-z]+\d+[A-Za-z0-9.\-]*)[\t ]{2,}(.+)$", txt, re.DOTALL)
+    if m:
+        return m.group(1).upper(), m.group(2).strip()
+    m = re.match(r"^(\d+)[\t ]{2,}(.+)$", txt, re.DOTALL)
+    if m:
+        return f"NUM_{m.group(1)}", m.group(2).strip()
+    return None, None
+
+def _parse_docx_lines(lines_iter, items, current_section, current_question):
+    """Shared line parser for table rows and body paragraphs."""
+    for txt in lines_iter:
+        txt = txt.strip()
+        if not txt:
+            continue
+
+        if txt.isupper() and len(txt) < 120:
+            current_section = txt
+            items.append({
+                "id": current_section,
+                "type": "section",
+                "sectionId": current_section,
+                "text": txt,
+                "answers": []
+            })
+            current_question = None
+            continue
+
+        qid, qtext = _match_question_line(txt)
+        if qid:
+            current_question = {
+                "id": qid,
+                "type": "question",
+                "sectionId": current_section,
+                "text": qtext,
+                "answers": []
+            }
+            items.append(current_question)
+            continue
+
+        m2 = re.match(r"^(\d+)\s+(.+)$", txt, re.DOTALL)
+        if m2 and current_question:
+            current_question["answers"].append({
+                "id": f"{current_question['id']}_{m2.group(1)}",
+                "role": "row",
+                "number": m2.group(1),
+                "text": m2.group(2).strip()
+            })
+            continue
+
+    return current_section, current_question
+
 def parse_docx(file_bytes):
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+        doc = Document(tmp_path)
 
-    doc = Document(tmp_path)
+        items = []
+        current_section = "default"
+        current_question = None
 
-    items = []
-    current_section = "default"
-    current_question = None
+        def table_lines():
+            for table in doc.tables:
+                for row in table.rows:
+                    if not row.cells:
+                        continue
+                    t = _row_text(row.cells)
+                    if t:
+                        yield t
 
-    # -------- TABLES FIRST --------
+        current_section, current_question = _parse_docx_lines(
+            table_lines(), items, current_section, current_question
+        )
 
-    for table in doc.tables:
+        if not items:
+            def para_lines():
+                for para in doc.paragraphs:
+                    if para.text and para.text.strip():
+                        yield para.text
 
-        for row in table.rows:
+            current_section, current_question = _parse_docx_lines(
+                para_lines(), items, current_section, current_question
+            )
 
-            cells = row.cells
-
-            if len(cells) == 0:
-                continue
-
-            txt = cells[0].text.strip()
-
-            if not txt:
-                continue
-
-            # SECTION
-            if txt.isupper() and len(txt) < 120:
-
-                current_section = txt
-
-                items.append({
-                    "id": current_section,
-                    "type": "section",
-                    "sectionId": current_section,
-                    "text": txt,
-                    "answers": []
-                })
-
-                continue
-
-
-            # QUESTION
-            m = re.match(r'^([A-Z]+\d+[\.\w]*):?\s+(.*)', txt)
-
-            if m:
-                qid = m.group(1)
-                qtext = m.group(2)
-
-                current_question = {
-                    "id": qid,
-                    "type": "question",
-                    "sectionId": current_section,
-                    "text": qtext,
-                    "answers": []
-                }
-
-                items.append(current_question)
-
-                continue
-
-
-            # ANSWER ROW
-            m2 = re.match(r'^(\d+)\s+(.*)', txt)
-
-            if m2 and current_question:
-
-                current_question["answers"].append({
-                    "id": f"{current_question['id']}_{m2.group(1)}",
-                    "role": "row",
-                    "number": m2.group(1),
-                    "text": m2.group(2)
-                })
-
-                continue
-
-
-    return items
+        return items
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 def parse_file(uploaded_file):
     ext = uploaded_file.name.lower().split('.')[-1]
@@ -329,35 +365,34 @@ def generate_docx(merged, primary_label, secondary_label):
                     for run in para.runs:
                         run.bold = True
                         run.font.size = Pt(10)
-                        
+
         # Answer rows
         for ans in item['answers']:
             if not ans['primary']:
                 continue
-                
+
             row = table.add_row()
             cells = row.cells
-            
+
             prefix = '    •  ' if ans['role'] == 'row' else '    ○  '
             num = ans.get('number', '')
-            
+
             cells[0].text = f"{prefix}{num} {ans['primary']}".strip()
             cells[1].text = f"{prefix}{num} {ans['secondary']}".strip()
-            
+
             for cell in cells:
                 for para in cell.paragraphs:
                     for run in para.runs:
                         run.font.size = Pt(9)
-                    
-        # Set column widths
-            for row in table.rows:
-                for i, cell in enumerate(row.cells):
-                    cell.width = Inches(3.8)
-                    
-                buf = io.BytesIO()
-                doc.save(buf)
-                buf.seek(0)
-                return buf
+
+    for row in table.rows:
+        for cell in row.cells:
+            cell.width = Inches(3.8)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
 
 # ── UI ─────────────────────────────────────────
 
@@ -401,6 +436,14 @@ if primary_file and secondary_file:
                     f"✅ Merged {len(merged)} items successfully"
                 )
 
+                if len(merged) == 0:
+                    st.warning(
+                        "No items were parsed from the DOCX/XML files. "
+                        "Expected sections (short ALL-CAPS lines), questions like "
+                        "`Q1: text` or `1. text`, and answer lines `1 answer text`. "
+                        "If your Word file uses a different layout, try exporting survey XML instead."
+                    )
+
                 with st.expander("Preview merged data (first 10 items)"):
                     st.json(merged[:10])
 
@@ -411,12 +454,13 @@ if primary_file and secondary_file:
                         secondary_label
                     )
 
-                st.download_button(
-                    label="📥 Download DOCX",
-                    data=docx_buf,
-                    file_name="survey_bilingual.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
+                if docx_buf is not None:
+                    st.download_button(
+                        label="📥 Download DOCX",
+                        data=docx_buf,
+                        file_name="survey_bilingual.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    )
 
             except Exception as e:
                 st.error(f"Error: {str(e)}")
