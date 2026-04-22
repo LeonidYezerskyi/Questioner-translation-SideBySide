@@ -68,8 +68,48 @@ _META_LINE_PREFIXES = (
 
 
 def _docx_is_meta_line(txt):
-    t = txt.strip()
+    """Script notes: ``Q Type:``, ``Programmer notes:``, often prefixed with ``o`` + tab."""
+    t = (txt or "").strip()
+    t = re.sub(r"^[oO]\s*[\.\t\u00a0\-]+\s*", "", t)
+    t = re.sub(r"^[•\u2022\u2023\u2219]\s+", "", t)
+    t = t.strip()
     return any(t.startswith(p) for p in _META_LINE_PREFIXES)
+
+
+def _docx_meta_is_pre_question(txt):
+    """Lines that usually belong to the *next* script question (not the previous block)."""
+    t = (txt or "").strip()
+    t = re.sub(r"^[oO]\s*[\.\t\u00a0\-]+\s*", "", t)
+    t = re.sub(r"^[•\u2022\u2023\u2219]\s+", "", t).strip()
+    return t.startswith(("Q Type:", "Тип запитання:"))
+
+
+def _buf_pop_edge_meta_into_notes(buf, notes_out):
+    """Move leading / trailing meta paragraphs from ``buf`` into ``notes_out`` (document order)."""
+    while buf and buf[0][0] == "p" and _docx_is_meta_line(buf[0][1]):
+        notes_out.append(buf.pop(0)[1].strip())
+    tail = []
+    while buf and buf[-1][0] == "p" and _docx_is_meta_line(buf[-1][1]):
+        tail.append(buf.pop(-1)[1].strip())
+    tail.reverse()
+    notes_out.extend(tail)
+
+
+def _append_question_notes_to_cell(cell, lines):
+    """Append ``o``-style note lines below existing cell content (e.g. under nested answer table)."""
+    for raw in lines or []:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        p = cell.add_paragraph()
+        if re.match(r"^[oO]\s*[\.\t\u00a0\-]", line):
+            body = line
+        else:
+            body = "o\t" + line
+        run = p.add_run(body)
+        run.font.size = Pt(9)
+        run.bold = False
+        run.font.color.rgb = RGBColor(0x44, 0x55, 0x66)
 
 
 # Short standalone caps lines (mode labels) must not become extra "sections" or they
@@ -402,10 +442,22 @@ def _docx_flush_question_buffer(current_q, buf):
     if not current_q or not buf:
         return
 
-    while buf and buf[0][0] == "p" and _docx_is_meta_line(buf[0][1]):
-        buf.pop(0)
-    while buf and buf[-1][0] == "p" and _docx_is_meta_line(buf[-1][1]):
-        buf.pop()
+    notes = current_q.setdefault("notes", [])
+
+    split_at = None
+    for i, (k, t) in enumerate(buf):
+        if k == "p" and _docx_is_meta_line(t):
+            split_at = i
+            break
+    had_split = split_at is not None
+    if had_split:
+        for k, d in buf[split_at:]:
+            if k == "p" and _docx_is_meta_line(d):
+                notes.append(d.strip())
+        buf[:] = buf[:split_at]
+
+    _buf_pop_edge_meta_into_notes(buf, notes)
+
     if not buf:
         return
 
@@ -425,21 +477,15 @@ def _docx_flush_question_buffer(current_q, buf):
                 current_q["answers"].extend(_docx_table_to_answers(current_q["id"], d))
         return
 
-    split_at = None
-    for i, (k, t) in enumerate(buf):
-        if k == "p" and _docx_is_meta_line(t):
-            split_at = i
-            break
-
     texts = [d.strip() for k, d in buf if k == "p" and not _docx_is_meta_line(d)]
 
-    if split_at is None:
+    if not had_split:
         _docx_flush_paragraph_buffer_core(current_q, texts)
         return
 
     pre_texts = [
         d.strip()
-        for k, d in buf[:split_at]
+        for k, d in buf
         if k == "p" and not _docx_is_meta_line(d)
     ]
     if not pre_texts:
@@ -465,6 +511,7 @@ def parse_docx(file_bytes):
         section_id = "SEC_0"
         current_q = None
         buf = []
+        pending_notes = []
 
         for kind, item in _iter_block_items(doc):
             if kind == "p":
@@ -476,6 +523,7 @@ def parse_docx(file_bytes):
                     _docx_flush_question_buffer(current_q, buf)
                     buf = []
                     current_q = None
+                    pending_notes.clear()
                     sid = f"SEC_{sec_idx}"
                     sec_idx += 1
                     section_id = sid
@@ -500,8 +548,19 @@ def parse_docx(file_bytes):
                         "sectionId": section_id,
                         "text": title,
                         "answers": [],
+                        "notes": list(pending_notes),
                     }
+                    pending_notes.clear()
                     items.append(current_q)
+                    continue
+
+                if _docx_is_meta_line(t):
+                    if _docx_meta_is_pre_question(t):
+                        pending_notes.append(t.strip())
+                    elif current_q:
+                        buf.append(("p", t))
+                    else:
+                        pending_notes.append(t.strip())
                     continue
 
                 if current_q:
@@ -816,6 +875,8 @@ def merge(primary_items, secondary_items):
             'primary': p_item['text'],
             'secondary': s_item['text'] if s_item else '',
             'answers': merged_ans,
+            'notes_primary': list(p_item.get('notes') or []),
+            'notes_secondary': list((s_item or {}).get('notes') or []),
         })
     return merged
 
@@ -1018,8 +1079,11 @@ def generate_docx(merged, primary_label, secondary_label):
         prim = (item.get("primary") or "").strip()
         sec = (item.get("secondary") or "").strip()
         has_answers = any((a.get("primary") or "").strip() for a in answers)
+        notes_p = item.get("notes_primary") or []
+        notes_s = item.get("notes_secondary") or []
+        has_notes = bool(notes_p or notes_s)
 
-        if not prim and not has_answers:
+        if not prim and not has_answers and not has_notes:
             continue
 
         qrow = table.add_row()
@@ -1040,6 +1104,16 @@ def generate_docx(merged, primary_label, secondary_label):
                 set_cell_bg(c, "FFFFFF")
             _add_nested_answer_table(oc0, answers, True, col_half)
             _add_nested_answer_table(oc1, answers, False, col_half)
+            if has_notes:
+                _append_question_notes_to_cell(oc0, notes_p)
+                _append_question_notes_to_cell(oc1, notes_s)
+        elif has_notes:
+            opt_row = table.add_row()
+            oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
+            for c in (oc0, oc1):
+                set_cell_bg(c, "FFFFFF")
+            _append_question_notes_to_cell(oc0, notes_p)
+            _append_question_notes_to_cell(oc1, notes_s)
 
     for row in table.rows:
         for cell in row.cells:
