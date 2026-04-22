@@ -15,7 +15,7 @@ from docx.oxml import OxmlElement
 import io
 import json
 import os
-from collections import deque
+from collections import deque, defaultdict
 import tempfile
 import re
 
@@ -53,11 +53,20 @@ def _docx_is_meta_line(txt):
     return any(t.startswith(p) for p in _META_LINE_PREFIXES)
 
 
+# Short standalone caps lines (mode labels) must not become extra "sections" or they
+# desync EN vs UA and shift every following row in the bilingual table.
+_SECTION_SINGLE_WORD_DENY = frozenset({
+    "OFFLINE", "ONLINE", "ОФЛАЙН", "ОНЛАЙН", "CATI", "CAWI", "CAPI",
+})
+
+
 def _docx_looks_like_section(txt):
     t = txt.strip()
     if _docx_is_meta_line(t) or _RE_DOCX_Q.match(t):
         return False
     if len(t) < 4 or len(t) > 140:
+        return False
+    if t.upper() in _SECTION_SINGLE_WORD_DENY:
         return False
     if re.match(r"^Part\s+[A-Z]\.", t):
         return True
@@ -66,6 +75,54 @@ def _docx_looks_like_section(txt):
         return False
     upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
     return upper_ratio >= 0.72
+
+
+def _docx_looks_like_option_paragraph(line, stem_first_line):
+    """
+    Heuristic: lines after the script question that are answer rows / show lines / inputs.
+    Avoid treating a single long continuation paragraph of the stem as an option.
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _docx_is_meta_line(s):
+        return False
+    # Numbered / lettered options: 1. 2) 99. a)
+    if re.match(r"^(\d+|[a-zA-Z])\s*[\).:]\s+\S", s):
+        return True
+    if s.startswith("["):
+        return True
+    # Script markers
+    if re.search(r"\[EXCLUSIVE\]|\[exclusive\]", s, re.I):
+        return True
+    stem = (stem_first_line or "").strip()
+    stem_is_question = bool(stem) and stem.rstrip().endswith("?")
+    # After a question stem, follow-on lines are usually options / prompts (allow long statements)
+    if stem_is_question and len(s) <= 900 and not s.endswith("?"):
+        if len(s) > 360:
+            return bool(
+                re.match(r"^(\d+|[a-zA-Z])\s*[\).:]\s", s)
+                or s.startswith("[")
+                or re.match(
+                    r"^(I am|We |This is|None of|The |Other|Air |Ocean |Land )",
+                    s,
+                    re.I,
+                )
+                or re.match(r"^(Я |Ми |Це |Інш|Жодн)", s, re.I)
+            )
+        return True
+    # Statement-style script (stem ends with .) — still often followed by fixed statements
+    if stem.rstrip().endswith(".") and len(s) <= 900:
+        if re.match(
+            r"^(I am|We |This is|None of|The |Other|Air |Ocean |Land |\d|\[|Я |Ми |Це |Інш|Жодн)",
+            s,
+            re.I,
+        ):
+            return True
+    # Percent / open input lines
+    if re.search(r"_%\]|____%|___%", s):
+        return True
+    return False
 
 
 def _docx_table_to_answers(qid, table):
@@ -127,18 +184,26 @@ def _docx_flush_question_buffer(current_q, buf):
     texts = [d.strip() for k, d in buf if k == "p" and not _docx_is_meta_line(d)]
 
     if split_at is None:
-        if len(buf) <= 5:
-            current_q["text"] = "\n".join(texts).strip()
+        if not texts:
             return
-        if texts:
+        if len(texts) == 1:
             current_q["text"] = texts[0]
-            for j, ot in enumerate(texts[1:], 1):
-                current_q["answers"].append({
-                    "id": f"{current_q['id']}_{j}",
-                    "role": "row",
-                    "number": str(j),
-                    "text": ot,
-                })
+            return
+        stem_first = texts[0]
+        i = 1
+        stem_parts = [stem_first]
+        while i < len(texts) and not _docx_looks_like_option_paragraph(texts[i], stem_first):
+            stem_parts.append(texts[i])
+            i += 1
+        current_q["text"] = "\n".join(stem_parts).strip()
+        opt_lines = texts[i:]
+        for j, ot in enumerate(opt_lines, 1):
+            current_q["answers"].append({
+                "id": f"{current_q['id']}_{j}",
+                "role": "row",
+                "number": str(j),
+                "text": ot,
+            })
         return
 
     pre_texts = [
@@ -444,19 +509,57 @@ def _answers_merge_by_ids_ok(primary_answers, secondary_answers):
     hits = sum(1 for a in primary_answers if sm.get(a['id'], '').strip())
     return hits / len(primary_answers) >= 0.92
 
+def _split_secondary_question_body_to_answers(s_item, pa):
+    """
+    If options were merged into question ``text`` (legacy flush / Word layout),
+    move trailing lines into answer rows aligned with ``pa`` by count/order.
+    """
+    if not s_item or not pa:
+        return s_item, []
+    sa = list(s_item.get('answers') or [])
+    if len(sa) >= len(pa):
+        return s_item, sa
+    body = (s_item.get('text') or '').strip()
+    if not body:
+        return s_item, sa
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    if len(lines) < 2 or len(lines) - 1 < len(pa):
+        return s_item, sa
+    head, tail = lines[0], lines[1:]
+    if len(tail) < len(pa):
+        return s_item, sa
+    fixed = dict(s_item)
+    fixed['text'] = head
+    new_sa = []
+    for i, a in enumerate(pa):
+        new_sa.append({
+            'id': a['id'],
+            'role': a.get('role', 'row'),
+            'number': a.get('number', ''),
+            'text': tail[i] if i < len(tail) else '',
+        })
+    return fixed, new_sa
+
+
 def merge(primary_items, secondary_items):
-    """Merge primary and secondary by ID."""
-    secondary_map = {item['id']: item for item in secondary_items}
-    secondary_answer_map = {}
+    """Merge primary and secondary by ID (FIFO when the same id appears more than once)."""
+    secondary_queues = defaultdict(deque)
     for item in secondary_items:
-        for ans in item.get('answers', []):
-            secondary_answer_map[ans['id']] = ans['text']
+        secondary_queues[item['id']].append(item)
 
     merged = []
     for p_item in primary_items:
-        s_item = secondary_map.get(p_item['id'])
+        qid = p_item['id']
+        qsec = secondary_queues.get(qid)
+        s_item = qsec.popleft() if qsec else None
+
         pa = p_item.get('answers', [])
-        sa = s_item.get('answers', []) if s_item else []
+        sa = list(s_item.get('answers', [])) if s_item else []
+
+        if s_item is not None:
+            s_item, sa = _split_secondary_question_body_to_answers(s_item, pa)
+
+        secondary_answer_map = {a['id']: (a.get('text') or '') for a in sa}
 
         if pa and sa and not _answers_merge_by_ids_ok(pa, sa):
             merged_ans = _merge_answer_lists_aligned(pa, sa)
