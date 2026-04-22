@@ -101,11 +101,27 @@ def _docx_stem_looks_complete(stem_text):
     s = (stem_text or "").strip()
     if not s:
         return False
+    # H1 scripts often end the *paragraph* with a full stop after a mid-sentence ``?``.
+    if "?" in s and len(s) > 35:
+        return True
     if s.endswith(("?", "!", "…", ".", ":", "：")):
         return True
     if len(s) > 220:
         return True
     return False
+
+
+def _stem_invites_answer_list(stem_text):
+    """Stems that introduce a following list even when the last character is not ``?``."""
+    s = (stem_text or "").lower()
+    return bool(
+        re.search(r"\bselect all that apply\b", s)
+        or re.search(r"\bplease select\b", s)
+        or re.search(r"\brefer to statements\b", s)
+        or re.search(r"\bвиберіть усі\b", s)
+        or re.search(r"\bзверніться до твердж\b", s)
+        or re.search(r"\bstatements?\b", s)
+    )
 
 
 def _docx_looks_like_option_paragraph(line, stem_first_line):
@@ -132,7 +148,9 @@ def _docx_looks_like_option_paragraph(line, stem_first_line):
     if re.search(r"\[EXCLUSIVE\]|\[exclusive\]", s, re.I):
         return True
     stem = (stem_first_line or "").strip()
-    stem_is_question = bool(stem) and stem.rstrip().endswith("?")
+    stem_invites_options = bool(stem) and (
+        ("?" in stem) or _stem_invites_answer_list(stem)
+    )
     # Mid-sentence continuation (e.g. UA wrap) — not an answer row
     if stem and not _docx_stem_looks_complete(stem):
         if len(s) < 100 and not s.startswith(("[", "(")) and not re.match(
@@ -140,7 +158,7 @@ def _docx_looks_like_option_paragraph(line, stem_first_line):
         ):
             return False
     # After a question stem, follow-on lines are usually options / prompts (allow long statements)
-    if stem_is_question and len(s) <= 900 and not s.endswith("?"):
+    if stem_invites_options and len(s) <= 900 and not s.endswith("?"):
         if len(s) > 360:
             return bool(
                 re.match(r"^(\d+|[a-zA-Z])\s*[\).:]\s", s)
@@ -364,6 +382,19 @@ def _docx_flush_paragraph_buffer_core(current_q, texts):
             "number": str(j),
             "text": ot,
         })
+
+    if not current_q.get("answers") and len(cont) >= 2:
+        ref = (header + "\n" + "\n".join(cont)).strip() if header else "\n".join(cont).strip()
+        if ("?" in ref or _stem_invites_answer_list(ref)) and not _RE_DOCX_Q.match(cont[1]):
+            current_q["text"] = (header + "\n" + cont[0]).strip() if header else cont[0]
+            current_q["answers"] = []
+            for j, ot in enumerate(cont[1:], 1):
+                current_q["answers"].append({
+                    "id": f"{current_q['id']}_{j}",
+                    "role": "row",
+                    "number": str(j),
+                    "text": ot,
+                })
 
 
 def _docx_flush_question_buffer(current_q, buf):
