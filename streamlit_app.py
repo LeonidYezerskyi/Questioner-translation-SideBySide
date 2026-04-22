@@ -76,6 +76,68 @@ def extract_answers(elem):
                 })
     return answers
 
+_INTRO_SUFFIX = "_intro"
+_SCRIPT_QID_IN_BODY = re.compile(r"^([A-Za-z]+\d*(?:\.[0-9]+)*)\s*:\s")
+
+
+def _textblock_script_target_qid(textblock_id, body):
+    """
+    Map a script-style textblock (e.g. ``F4_intro`` / ``A5: Tonnage…``) to the question ``id``
+    that should receive it as ``script_header``.
+    """
+    tid = (textblock_id or "").strip()
+    body = (body or "").strip()
+    if tid.endswith(_INTRO_SUFFIX) and len(tid) > len(_INTRO_SUFFIX):
+        base = tid[: -len(_INTRO_SUFFIX)]
+        if base and not base.lower().startswith("textblock"):
+            return base
+    m = _SCRIPT_QID_IN_BODY.match(body)
+    if m:
+        return m.group(1)
+    return None
+
+
+def extract_programmer_notes_from_question(elem):
+    """
+    Collect programmer-facing lines from ``skip_logic_block`` descriptions and ``action``
+    reasons (screening, hide_question, etc.) in the survey XML.
+    """
+    raw = []
+    for slb in elem.iter("skip_logic_block"):
+        desc = (slb.get("description") or "").strip()
+        if desc:
+            raw.append(f"Logic: {desc}")
+    for act in elem.iter("action"):
+        typ = (act.get("type") or "").strip()
+        tgt = (act.get("target") or "").strip()
+        reason = (act.get("reason") or "").strip()
+        if reason:
+            raw.append(f"Action ({typ or '…'}): {reason}")
+        elif typ == "hide_question" and tgt:
+            raw.append(f"Display: hide_question → {tgt}")
+
+    out, seen = [], set()
+    for line in raw:
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
+
+
+def _flush_pending_script_as_textblock(items, section_id, pending):
+    if not pending:
+        return
+    items.append({
+        "id": f"{section_id}_script_{len(items)}",
+        "type": "textblock",
+        "sectionId": section_id,
+        "text": pending["text"],
+        "answers": [],
+        "script_header": "",
+        "notes": [],
+    })
+
+
 def parse_xml(xml_bytes):
     """Parse XML bytes into normalized list of items."""
     root = ET.fromstring(xml_bytes)
@@ -84,31 +146,69 @@ def parse_xml(xml_bytes):
     for section in root.findall('.//section'):
         section_id = section.get('id', '')
         section_title = section.get('title', section_id)
+        pending_script = None
 
         items.append({
             'id': section_id,
             'type': 'section',
             'sectionId': section_id,
             'text': section_title,
-            'answers': []
+            'answers': [],
+            'script_header': '',
+            'notes': [],
         })
 
-        # Dynamically find all question-type children
         for child in section:
             tag = child.tag
             if tag in NON_QUESTION_KEYS:
                 continue
-            q_id = child.get('id')
+
+            if tag == "textblock":
+                tid = (child.get("id") or "").strip()
+                body = extract_title(child).strip()
+                hint = _textblock_script_target_qid(tid, body)
+                if hint:
+                    if pending_script:
+                        _flush_pending_script_as_textblock(items, section_id, pending_script)
+                    pending_script = {"qid": hint, "text": body}
+                else:
+                    items.append({
+                        "id": tid or f"{section_id}_tb_{len(items)}",
+                        "type": "textblock",
+                        "sectionId": section_id,
+                        "text": body,
+                        "answers": [],
+                        "script_header": "",
+                        "notes": [],
+                    })
+                continue
+
+            q_id = child.get("id")
             if not q_id:
                 continue
 
+            if pending_script and pending_script["qid"] != q_id:
+                _flush_pending_script_as_textblock(items, section_id, pending_script)
+                pending_script = None
+
+            script_header = ""
+            if pending_script and pending_script["qid"] == q_id:
+                script_header = pending_script["text"]
+                pending_script = None
+
+            notes = extract_programmer_notes_from_question(child)
             items.append({
-                'id': q_id,
-                'type': tag,
-                'sectionId': section_id,
-                'text': extract_title(child),
-                'answers': extract_answers(child)
+                "id": q_id,
+                "type": tag,
+                "sectionId": section_id,
+                "text": extract_title(child),
+                "answers": extract_answers(child),
+                "script_header": script_header,
+                "notes": notes,
             })
+
+        if pending_script:
+            _flush_pending_script_as_textblock(items, section_id, pending_script)
 
     return items
 
@@ -296,6 +396,8 @@ def merge(primary_items, secondary_items):
             'answers': merged_ans,
             'notes_primary': list(p_item.get('notes') or []),
             'notes_secondary': list((s_item or {}).get('notes') or []),
+            'script_header_primary': (p_item.get('script_header') or '').strip(),
+            'script_header_secondary': ((s_item or {}).get('script_header') or '').strip(),
         })
     return merged
 
@@ -326,7 +428,7 @@ def _format_question_heading(qid, body_text):
     return f"{qid}. {body}"
 
 
-def _set_cell_multiline_text(cell, text, font_pt=9):
+def _set_cell_multiline_text(cell, text, font_pt=9, bold=False, italic=False):
     """
     Put ``text`` into ``cell``, splitting on ``\\n`` into separate paragraphs so Word
     shows stacked lines inside the cell (single-run ``cell.text`` does not reliably).
@@ -339,8 +441,40 @@ def _set_cell_multiline_text(cell, text, font_pt=9):
         cell.add_paragraph(ln)
     for para in cell.paragraphs:
         for run in para.runs:
-            run.bold = False
+            run.bold = bold
+            run.italic = italic
             run.font.size = Pt(font_pt)
+
+
+def _paragraph_space_after(para, pt):
+    para.paragraph_format.space_after = Pt(pt)
+
+
+def _paragraph_space_before(para, pt):
+    para.paragraph_format.space_before = Pt(pt)
+
+
+def _append_one_question_note_line(cell, raw):
+    """Single note paragraph in a language column (``o`` + tab if source had no bullet)."""
+    line = (raw or "").strip()
+    p = cell.add_paragraph()
+    if not line:
+        body = "\u00a0"
+    elif re.match(r"^[oO]\s*[\.\t\u00a0\-]", line):
+        body = line
+    else:
+        body = "o\t" + line
+    run = p.add_run(body)
+    run.font.size = Pt(9)
+    run.bold = False
+    run.font.color.rgb = RGBColor(0x44, 0x55, 0x66)
+
+
+def _append_question_notes_paired(cell_en, cell_ua, lines_en, lines_ua):
+    """Paired EN/UA note lines so rows stay aligned."""
+    for raw_en, raw_ua in zip_longest(lines_en or [], lines_ua or [], fillvalue=""):
+        _append_one_question_note_line(cell_en, raw_en)
+        _append_one_question_note_line(cell_ua, raw_ua)
 
 
 def _set_table_width_percent(table, pct_fiftieths):
@@ -492,7 +626,7 @@ def generate_docx(merged, primary_label, secondary_label):
                         run.font.size = Pt(9)
             continue
 
-        # Questions: heading row, then next row = nested option tables (no spacer row)
+        # Questions: optional script row (XML textblock), question row, answers + notes
         qid = str(item.get("id", ""))
         answers = item.get("answers") or []
         prim = (item.get("primary") or "").strip()
@@ -501,28 +635,50 @@ def generate_docx(merged, primary_label, secondary_label):
         notes_p = item.get("notes_primary") or []
         notes_s = item.get("notes_secondary") or []
         has_notes = bool(notes_p or notes_s)
+        sh_p = (item.get("script_header_primary") or "").strip()
+        sh_s = (item.get("script_header_secondary") or "").strip()
+        has_sh = bool(sh_p or sh_s)
 
-        if not prim and not has_answers and not has_notes:
+        if not prim and not has_answers and not has_notes and not has_sh:
             continue
+
+        if has_sh:
+            sh_row = table.add_row()
+            sh_cells = sh_row.cells
+            _set_cell_multiline_text(sh_cells[0], sh_p, font_pt=11, bold=True, italic=False)
+            _set_cell_multiline_text(sh_cells[1], sh_s, font_pt=11, bold=True, italic=False)
+            for c in sh_cells:
+                set_cell_bg(c, "E8ECF0")
+                for para in c.paragraphs:
+                    for run in para.runs:
+                        run.font.color.rgb = RGBColor(0x22, 0x22, 0x22)
+                if c.paragraphs:
+                    _paragraph_space_after(c.paragraphs[-1], 4)
 
         qrow = table.add_row()
         qc = qrow.cells
-        qc[0].text = _format_question_heading(qid, prim) if prim else f"{qid}."
-        qc[1].text = _format_question_heading(qid, sec) if sec else f"{qid}."
+        qh0 = _format_question_heading(qid, prim) if prim else f"{qid}."
+        qh1 = _format_question_heading(qid, sec) if sec else f"{qid}."
+        _set_cell_multiline_text(qc[0], qh0, font_pt=10, bold=True, italic=True)
+        _set_cell_multiline_text(qc[1], qh1, font_pt=10, bold=True, italic=True)
         for cell in qc:
             set_cell_bg(cell, "EBF5FB")
-            for para in cell.paragraphs:
-                for run in para.runs:
-                    run.bold = True
-                    run.font.size = Pt(10)
+            if cell.paragraphs:
+                _paragraph_space_after(cell.paragraphs[-1], 8)
 
         if has_answers:
             opt_row = table.add_row()
             oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
             for c in (oc0, oc1):
                 set_cell_bg(c, "FFFFFF")
+            _paragraph_space_after(oc0.paragraphs[0], 8)
+            _paragraph_space_after(oc1.paragraphs[0], 8)
             _add_nested_answer_table(oc0, answers, True, col_half)
             _add_nested_answer_table(oc1, answers, False, col_half)
+            a0 = oc0.add_paragraph("")
+            a1 = oc1.add_paragraph("")
+            _paragraph_space_before(a0, 8)
+            _paragraph_space_before(a1, 8)
             if has_notes:
                 _append_question_notes_paired(oc0, oc1, notes_p, notes_s)
         elif has_notes:
