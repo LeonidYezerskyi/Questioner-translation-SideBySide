@@ -18,8 +18,9 @@ from collections import deque, defaultdict
 from itertools import zip_longest
 import re
 
-# Усі розміри шрифту в згенерованому DOCX: +50% до базових значень
-FONT_SCALE = 1.5
+# Усі розміри шрифту в згенерованому DOCX (множник до логічних pt)
+# Було 1.5; зменшено на 20% → 1.5 * 0.8 = 1.2
+FONT_SCALE = 1.2
 
 
 def _fpt(n: float) -> Pt:
@@ -321,11 +322,24 @@ def _merge_answer_lists_aligned(primary_answers, secondary_answers):
         })
     return rows
 
+def _answer_ids_all_unique(answers):
+    """
+    When row ``id`` repeats (e.g. many ``<row id="B1">`` on ``textquestion``), mapping
+    by id is invalid — merge must follow document order.
+    """
+    if not answers:
+        return True
+    ids = [(a.get("id") or "") for a in answers]
+    return len(ids) == len(set(ids))
+
+
 def _answers_merge_by_ids_ok(primary_answers, secondary_answers):
     """True when ids line up (same count + almost every id has non-empty secondary text)."""
     if not primary_answers:
         return True
     if len(primary_answers) != len(secondary_answers):
+        return False
+    if not _answer_ids_all_unique(primary_answers) or not _answer_ids_all_unique(secondary_answers):
         return False
     sm = {a['id']: a.get('text', '') for a in secondary_answers}
     hits = sum(1 for a in primary_answers if sm.get(a['id'], '').strip())
