@@ -16,6 +16,7 @@ import io
 import json
 import os
 from collections import deque, defaultdict
+from itertools import zip_longest
 import tempfile
 import re
 
@@ -64,6 +65,8 @@ _META_LINE_PREFIXES = (
     "Тип запитання:",
     "Ротація/Рандомізація:",
     "Примітки програміста:",
+    # UA H1 script uses this wording (with «для»)
+    "Примітки для програміста:",
 )
 
 
@@ -73,7 +76,14 @@ def _docx_is_meta_line(txt):
     t = re.sub(r"^[oO]\s*[\.\t\u00a0\-]+\s*", "", t)
     t = re.sub(r"^[•\u2022\u2023\u2219]\s+", "", t)
     t = t.strip()
-    return any(t.startswith(p) for p in _META_LINE_PREFIXES)
+    if any(t.startswith(p) for p in _META_LINE_PREFIXES):
+        return True
+    tl = t.lower()
+    if tl.startswith("programmer notes:"):
+        return True
+    if re.match(r"^примітки\s+для\s+програміста\s*:", t, re.I):
+        return True
+    return False
 
 
 def _docx_meta_is_pre_question(txt):
@@ -95,21 +105,30 @@ def _buf_pop_edge_meta_into_notes(buf, notes_out):
     notes_out.extend(tail)
 
 
-def _append_question_notes_to_cell(cell, lines):
-    """Append ``o``-style note lines below existing cell content (e.g. under nested answer table)."""
-    for raw in lines or []:
-        line = (raw or "").strip()
-        if not line:
-            continue
-        p = cell.add_paragraph()
-        if re.match(r"^[oO]\s*[\.\t\u00a0\-]", line):
-            body = line
-        else:
-            body = "o\t" + line
-        run = p.add_run(body)
-        run.font.size = Pt(9)
-        run.bold = False
-        run.font.color.rgb = RGBColor(0x44, 0x55, 0x66)
+def _append_one_question_note_line(cell, raw):
+    """Single note paragraph in a language column (``o`` + tab if source had no bullet)."""
+    line = (raw or "").strip()
+    p = cell.add_paragraph()
+    if not line:
+        body = "\u00a0"
+    elif re.match(r"^[oO]\s*[\.\t\u00a0\-]", line):
+        body = line
+    else:
+        body = "o\t" + line
+    run = p.add_run(body)
+    run.font.size = Pt(9)
+    run.bold = False
+    run.font.color.rgb = RGBColor(0x44, 0x55, 0x66)
+
+
+def _append_question_notes_paired(cell_en, cell_ua, lines_en, lines_ua):
+    """
+    Same number of note paragraphs in EN / UA cells so lines stay aligned when one
+    language has an extra meta row or a missing translation line.
+    """
+    for raw_en, raw_ua in zip_longest(lines_en or [], lines_ua or [], fillvalue=""):
+        _append_one_question_note_line(cell_en, raw_en)
+        _append_one_question_note_line(cell_ua, raw_ua)
 
 
 # Short standalone caps lines (mode labels) must not become extra "sections" or they
@@ -1105,15 +1124,13 @@ def generate_docx(merged, primary_label, secondary_label):
             _add_nested_answer_table(oc0, answers, True, col_half)
             _add_nested_answer_table(oc1, answers, False, col_half)
             if has_notes:
-                _append_question_notes_to_cell(oc0, notes_p)
-                _append_question_notes_to_cell(oc1, notes_s)
+                _append_question_notes_paired(oc0, oc1, notes_p, notes_s)
         elif has_notes:
             opt_row = table.add_row()
             oc0, oc1 = opt_row.cells[0], opt_row.cells[1]
             for c in (oc0, oc1):
                 set_cell_bg(c, "FFFFFF")
-            _append_question_notes_to_cell(oc0, notes_p)
-            _append_question_notes_to_cell(oc1, notes_s)
+            _append_question_notes_paired(oc0, oc1, notes_p, notes_s)
 
     for row in table.rows:
         for cell in row.cells:
