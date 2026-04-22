@@ -18,13 +18,12 @@ from collections import deque, defaultdict
 from itertools import zip_longest
 import re
 
-# Усі розміри шрифту в згенерованому DOCX (множник до логічних pt)
-# Було 1.5; зменшено на 20% → 1.5 * 0.8 = 1.2
+# Global font scale for generated DOCX (logical pt × this constant; was 1.5, then −20%)
 FONT_SCALE = 1.2
 
 
 def _fpt(n: float) -> Pt:
-    """Пункти для ``run.font.size`` (``n`` — логічний розмір, напр. 10 → 15 pt)."""
+    """Scaled points for ``run.font.size`` (``n`` is logical size, e.g. 10 → 12 pt at 1.2)."""
     return Pt(n * FONT_SCALE)
 
 
@@ -732,17 +731,17 @@ def generate_docx(merged, primary_label, secondary_label):
 st.set_page_config(page_title="Survey Bilingual (XML)", layout="centered")
 st.title("Survey Bilingual — XML → DOCX")
 st.markdown(
-    "Завантажте **два XML** однакової структури (експорт опитування): перший — основна мова, "
-    "другий — переклад. Вихід — двоколонковий DOCX для звірки."
+    "Upload **two XML** files with the same structure (survey export): first language as the **primary** "
+    "column, second as the **translation** column. Output is a two-column DOCX for side-by-side review."
 )
 
 c1, c2 = st.columns(2)
 with c1:
-    primary_label = st.text_input("Підпис лівої колонки", value="English")
-    primary_file = st.file_uploader("XML (основна мова)", type=["xml"])
+    primary_label = st.text_input("Left column label", value="English")
+    primary_file = st.file_uploader("XML (primary language)", type=["xml"])
 with c2:
-    secondary_label = st.text_input("Підпис правої колонки", value="Translation")
-    secondary_file = st.file_uploader("XML (переклад)", type=["xml"])
+    secondary_label = st.text_input("Right column label", value="Translation")
+    secondary_file = st.file_uploader("XML (translation)", type=["xml"])
 
 if primary_file and secondary_file:
     if st.button("Generate bilingual DOCX", type="primary"):
@@ -766,4 +765,4 @@ if primary_file and secondary_file:
                 st.error(str(e))
                 st.exception(e)
 else:
-    st.info("Завантажте обидва XML.")
+    st.info("Upload both XML files to continue.")
