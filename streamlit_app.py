@@ -77,6 +77,18 @@ def _docx_looks_like_section(txt):
     return upper_ratio >= 0.72
 
 
+def _docx_stem_looks_complete(stem_text):
+    """Heuristic: question / instruction stem is complete enough to start answer list."""
+    s = (stem_text or "").strip()
+    if not s:
+        return False
+    if s.endswith(("?", "!", "…", ".", ":", "：")):
+        return True
+    if len(s) > 220:
+        return True
+    return False
+
+
 def _docx_looks_like_option_paragraph(line, stem_first_line):
     """
     Heuristic: lines after the script question that are answer rows / show lines / inputs.
@@ -97,6 +109,12 @@ def _docx_looks_like_option_paragraph(line, stem_first_line):
         return True
     stem = (stem_first_line or "").strip()
     stem_is_question = bool(stem) and stem.rstrip().endswith("?")
+    # Mid-sentence continuation (e.g. UA wrap) — not an answer row
+    if stem and not _docx_stem_looks_complete(stem):
+        if len(s) < 100 and not s.startswith(("[", "(")) and not re.match(
+            r"^(\d+|[a-zA-Z])\s*[\).:]\s", s
+        ):
+            return False
     # After a question stem, follow-on lines are usually options / prompts (allow long statements)
     if stem_is_question and len(s) <= 900 and not s.endswith("?"):
         if len(s) > 360:
@@ -125,27 +143,136 @@ def _docx_looks_like_option_paragraph(line, stem_first_line):
     return False
 
 
+def _cell_text_preserve_line_breaks(cell):
+    """Join non-empty paragraphs in a table cell with newlines (Word UI line breaks)."""
+    lines = []
+    for p in cell.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            lines.append(t)
+    return "\n".join(lines).strip()
+
+
+def _insert_newline_between_show_blocks(text):
+    """
+    Script answers sometimes pack two ``[Show …]`` / ``[Показувати …]`` blocks in one
+    paragraph without a break (EN tables often flatten to one line). Put later
+    directives on their own line like the UA script / Word layout.
+    """
+    if not text:
+        return text
+
+    show_pat = re.compile(r"(\s*)(\[(?:Show\b|Показувати)\b)", re.I)
+    hits = 0
+
+    def repl(m):
+        nonlocal hits
+        hits += 1
+        if hits == 1:
+            return m.group(0)
+        ws, br = m.group(1), m.group(2)
+        if "\n" in ws:
+            return m.group(0)
+        return "\n" + br
+
+    return show_pat.sub(repl, text)
+
+
 def _docx_table_to_answers(qid, table):
+    """One row per answer; first column may be empty in some script tables — use row index."""
     answers = []
-    for row in table.rows:
+    for ri, row in enumerate(table.rows):
         if not row.cells:
             continue
         code = row.cells[0].text.strip()
         label = (
-            row.cells[1].text.replace("\n", " ").strip()
+            _insert_newline_between_show_blocks(
+                _cell_text_preserve_line_breaks(row.cells[1])
+            )
             if len(row.cells) > 1
             else ""
         )
         if not code and not label:
             continue
-        if re.match(r"^[\d\-]+$", code):
-            answers.append({
-                "id": f"{qid}_{code}",
-                "role": "row",
-                "number": code,
-                "text": label,
-            })
+        if ri == 0 and code.lower() in ("code", "#", "no", "no.", "№") and re.search(
+            r"\blabel\b|\btext\b|\boption\b", label, re.I
+        ):
+            continue
+        if not re.match(r"^[\d\-]+$", code):
+            code = str(len(answers) + 1)
+        answers.append({
+            "id": f"{qid}_{code}",
+            "role": "row",
+            "number": code,
+            "text": label,
+        })
     return answers
+
+
+def _expand_buffer_paragraphs(texts, header):
+    """If one Word paragraph holds several newline-separated options, split into list items."""
+    out = []
+    for t in texts:
+        if "\n" not in t:
+            out.append(t)
+            continue
+        parts = [p.strip() for p in t.split("\n") if p.strip()]
+        if len(parts) <= 1:
+            out.append(t)
+            continue
+        if header and _docx_looks_like_option_paragraph(parts[0], header):
+            out.extend(parts)
+        else:
+            out.append(t)
+    return out
+
+
+def _docx_flush_paragraph_buffer_core(current_q, texts):
+    """
+    ``texts``: non-meta paragraph strings after the question header line (already stripped).
+    Uses ``current_q['text']`` from the header regex as stem start so option detection works.
+    """
+    header = (current_q.get("text") or "").strip()
+    texts = _expand_buffer_paragraphs(texts, header)
+    if not texts:
+        return
+    if len(texts) == 1:
+        only = texts[0]
+        if _docx_looks_like_option_paragraph(only, header):
+            current_q["answers"].append({
+                "id": f"{current_q['id']}_1",
+                "role": "row",
+                "number": "1",
+                "text": only,
+            })
+            return
+        if header:
+            current_q["text"] = (header + "\n" + only).strip()
+        else:
+            current_q["text"] = only
+        return
+
+    ref = header
+    i = 0
+    cont = []
+    while i < len(texts) and not _docx_looks_like_option_paragraph(texts[i], ref):
+        cont.append(texts[i])
+        ref = (header + "\n" + "\n".join(cont)).strip() if header else "\n".join(cont).strip()
+        i += 1
+    if cont:
+        current_q["text"] = (header + "\n" + "\n".join(cont)).strip() if header else "\n".join(cont).strip()
+    elif header:
+        current_q["text"] = header
+    else:
+        current_q["text"] = texts[0]
+        i = 1
+    for j, ot in enumerate(texts[i:], 1):
+        current_q["answers"].append({
+            "id": f"{current_q['id']}_{j}",
+            "role": "row",
+            "number": str(j),
+            "text": ot,
+        })
 
 
 def _docx_flush_question_buffer(current_q, buf):
@@ -169,7 +296,10 @@ def _docx_flush_question_buffer(current_q, buf):
                 stem_parts.append(d.strip())
             elif k == "t":
                 break
-        current_q["text"] = "\n".join(stem_parts).strip()
+        para_stem = "\n".join(stem_parts).strip()
+        header = (current_q.get("text") or "").strip()
+        if para_stem:
+            current_q["text"] = (header + "\n" + para_stem).strip() if header else para_stem
         for k, d in buf:
             if k == "t":
                 current_q["answers"].extend(_docx_table_to_answers(current_q["id"], d))
@@ -184,26 +314,7 @@ def _docx_flush_question_buffer(current_q, buf):
     texts = [d.strip() for k, d in buf if k == "p" and not _docx_is_meta_line(d)]
 
     if split_at is None:
-        if not texts:
-            return
-        if len(texts) == 1:
-            current_q["text"] = texts[0]
-            return
-        stem_first = texts[0]
-        i = 1
-        stem_parts = [stem_first]
-        while i < len(texts) and not _docx_looks_like_option_paragraph(texts[i], stem_first):
-            stem_parts.append(texts[i])
-            i += 1
-        current_q["text"] = "\n".join(stem_parts).strip()
-        opt_lines = texts[i:]
-        for j, ot in enumerate(opt_lines, 1):
-            current_q["answers"].append({
-                "id": f"{current_q['id']}_{j}",
-                "role": "row",
-                "number": str(j),
-                "text": ot,
-            })
+        _docx_flush_paragraph_buffer_core(current_q, texts)
         return
 
     pre_texts = [
@@ -213,14 +324,7 @@ def _docx_flush_question_buffer(current_q, buf):
     ]
     if not pre_texts:
         return
-    current_q["text"] = pre_texts[0]
-    for j, ot in enumerate(pre_texts[1:], 1):
-        current_q["answers"].append({
-            "id": f"{current_q['id']}_{j}",
-            "role": "row",
-            "number": str(j),
-            "text": ot,
-        })
+    _docx_flush_paragraph_buffer_core(current_q, pre_texts)
 
 
 def parse_docx(file_bytes):
@@ -431,17 +535,23 @@ def _leading_numbered_code_in_text(text):
 
 def _collapse_bracket_option_runs(texts):
     """
-    Merge consecutive short options that start with '[' (split Show/Показувати lines)
-    so two EN table rows map to two combined UA blocks instead of four UA lines.
+    Merge consecutive short ``[…]`` lines only when both are brief (one logical row split
+    across two paragraphs). Long bracket lines (e.g. F1 media labels) must stay separate
+    or EN/UA rows shift in the bilingual table.
     """
     out = []
     i = 0
     while i < len(texts):
-        t = (texts[i] or '').strip()
+        t = (texts[i] or "").strip()
         if i + 1 < len(texts):
-            u = (texts[i + 1] or '').strip()
-            if t.startswith('[') and u.startswith('['):
-                out.append(texts[i].rstrip() + '\n' + texts[i + 1].rstrip())
+            u = (texts[i + 1] or "").strip()
+            if (
+                t.startswith("[")
+                and u.startswith("[")
+                and len(t) < 120
+                and len(u) < 120
+            ):
+                out.append(texts[i].rstrip() + "\n" + texts[i + 1].rstrip())
                 i += 2
                 continue
         out.append(texts[i])
@@ -519,6 +629,8 @@ def _split_secondary_question_body_to_answers(s_item, pa):
     sa = list(s_item.get('answers') or [])
     if len(sa) >= len(pa):
         return s_item, sa
+    if sa:
+        return s_item, sa
     body = (s_item.get('text') or '').strip()
     if not body:
         return s_item, sa
@@ -527,6 +639,8 @@ def _split_secondary_question_body_to_answers(s_item, pa):
         return s_item, sa
     head, tail = lines[0], lines[1:]
     if len(tail) < len(pa):
+        return s_item, sa
+    if not head.rstrip().endswith(("?", ".", "!", "…", ":", "：")):
         return s_item, sa
     fixed = dict(s_item)
     fixed['text'] = head
@@ -612,6 +726,22 @@ def _format_question_heading(qid, body_text):
     return f"{qid}. {body}"
 
 
+def _set_cell_multiline_text(cell, text, font_pt=9):
+    """
+    Put ``text`` into ``cell``, splitting on ``\\n`` into separate paragraphs so Word
+    shows stacked lines inside the cell (single-run ``cell.text`` does not reliably).
+    """
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.strip() for ln in raw.split("\n")]
+    lines = [ln for ln in lines if ln] or ([""] if not raw.strip() else [])
+    cell.text = lines[0]
+    for ln in lines[1:]:
+        cell.add_paragraph(ln)
+    for para in cell.paragraphs:
+        for run in para.runs:
+            run.font.size = Pt(font_pt)
+
+
 def _set_table_width_percent(table, pct_fiftieths):
     """pct_fiftieths: 5000 = 100% of parent (Word ``pct`` width)."""
     tbl = table._tbl
@@ -658,13 +788,16 @@ def _add_nested_answer_table(cell, answers, use_primary_text, label_column_width
             label = (ans.get("secondary") or "").strip()
         row = nt.rows[ri]
         row.cells[0].text = num
-        row.cells[1].text = label
-        for c in row.cells:
-            for para in c.paragraphs:
-                for run in para.runs:
-                    run.font.size = Pt(9)
+        for para in row.cells[0].paragraphs:
+            for run in para.runs:
+                run.font.size = Pt(9)
+        _set_cell_multiline_text(row.cells[1], label, font_pt=9)
         row.cells[0].width = idx_w
         row.cells[1].width = lbl_w
+
+    for nrow in nt.rows:
+        for cell in nrow.cells:
+            set_cell_bg(cell, "FFFFFF")
 
 
 def generate_docx(merged, primary_label, secondary_label):
