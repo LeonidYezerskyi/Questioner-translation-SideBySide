@@ -576,9 +576,9 @@ def generate_docx(merged, primary_label, secondary_label):
     # Title
     title = doc.add_heading('Bilingual Survey Document', level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    for para in title.paragraphs:
-        for run in para.runs:
-            run.font.size = _fpt(16)
+    # add_heading returns a Paragraph, not a block with .paragraphs
+    for run in title.runs:
+        run.font.size = _fpt(16)
 
     doc.add_paragraph('')
 
