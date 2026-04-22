@@ -99,8 +99,9 @@ def _textblock_script_target_qid(textblock_id, body):
 
 def extract_programmer_notes_from_question(elem):
     """
-    Collect programmer-facing lines from ``skip_logic_block`` descriptions and ``action``
-    reasons (screening, hide_question, etc.) in the survey XML.
+    Notes from ``skip_logic_block`` descriptions and ``action`` (except ``end_survey``).
+    No ``Display:`` / hide_question lines. If ``shuffle="true"``, adds one
+    ``Rotate/Randomize: Randomize`` line (DOCX prepends ``o`` + tab when missing).
     """
     raw = []
     for slb in elem.iter("skip_logic_block"):
@@ -109,15 +110,19 @@ def extract_programmer_notes_from_question(elem):
             raw.append(f"Logic: {desc}")
     for act in elem.iter("action"):
         typ = (act.get("type") or "").strip()
-        tgt = (act.get("target") or "").strip()
         reason = (act.get("reason") or "").strip()
+        if typ == "end_survey":
+            continue
         if reason:
             raw.append(f"Action ({typ or '…'}): {reason}")
-        elif typ == "hide_question" and tgt:
-            raw.append(f"Display: hide_question → {tgt}")
+
+    if (elem.get("shuffle") or "").strip().lower() == "true":
+        raw.append("Rotate/Randomize: Randomize")
 
     out, seen = [], set()
     for line in raw:
+        if line.lstrip().lower().startswith("display:"):
+            continue
         if line not in seen:
             seen.add(line)
             out.append(line)
