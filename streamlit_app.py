@@ -18,6 +18,15 @@ from collections import deque, defaultdict
 from itertools import zip_longest
 import re
 
+# Усі розміри шрифту в згенерованому DOCX: +50% до базових значень
+FONT_SCALE = 1.5
+
+
+def _fpt(n: float) -> Pt:
+    """Пункти для ``run.font.size`` (``n`` — логічний розмір, напр. 10 → 15 pt)."""
+    return Pt(n * FONT_SCALE)
+
+
 NON_QUESTION_KEYS = {
     'id', 'title', 'current_version_id', 'current_version_number',
     'next_version_id', 'num_of_versions', 'plotly_export_format',
@@ -448,7 +457,7 @@ def _set_cell_multiline_text(cell, text, font_pt=9, bold=False, italic=False):
         for run in para.runs:
             run.bold = bold
             run.italic = italic
-            run.font.size = Pt(font_pt)
+            run.font.size = _fpt(font_pt)
 
 
 def _paragraph_space_after(para, pt):
@@ -470,7 +479,7 @@ def _append_one_question_note_line(cell, raw):
     else:
         body = "o\t" + line
     run = p.add_run(body)
-    run.font.size = Pt(9)
+    run.font.size = _fpt(9)
     run.bold = False
     run.font.color.rgb = RGBColor(0x44, 0x55, 0x66)
 
@@ -531,7 +540,7 @@ def _add_nested_answer_table(cell, answers, use_primary_text, label_column_width
         for para in row.cells[0].paragraphs:
             for run in para.runs:
                 run.bold = False
-                run.font.size = Pt(9)
+                run.font.size = _fpt(9)
         _set_cell_multiline_text(row.cells[1], label, font_pt=9)
         for para in row.cells[1].paragraphs:
             for run in para.runs:
@@ -567,6 +576,9 @@ def generate_docx(merged, primary_label, secondary_label):
     # Title
     title = doc.add_heading('Bilingual Survey Document', level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for para in title.paragraphs:
+        for run in para.runs:
+            run.font.size = _fpt(16)
 
     doc.add_paragraph('')
 
@@ -586,7 +598,7 @@ def generate_docx(merged, primary_label, secondary_label):
             for run in para.runs:
                 run.bold = True
                 run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                run.font.size = Pt(11)
+                run.font.size = _fpt(11)
 
     # Data rows
     for item in merged:
@@ -603,7 +615,7 @@ def generate_docx(merged, primary_label, secondary_label):
                         for run in para.runs:
                             run.bold = True
                             run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                            run.font.size = Pt(10)
+                            run.font.size = _fpt(10)
             else:
                 cells[0].merge(cells[1])
                 cells[0].text = f"  {item['primary'].upper()}"
@@ -612,7 +624,7 @@ def generate_docx(merged, primary_label, secondary_label):
                     for run in para.runs:
                         run.bold = True
                         run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                        run.font.size = Pt(10)
+                        run.font.size = _fpt(10)
             continue
 
         if item['type'] == 'textblock':
@@ -628,7 +640,7 @@ def generate_docx(merged, primary_label, secondary_label):
                 for para in cell.paragraphs:
                     for run in para.runs:
                         run.italic = True
-                        run.font.size = Pt(9)
+                        run.font.size = _fpt(9)
             continue
 
         # Questions: optional script row (XML textblock), question row, answers + notes
