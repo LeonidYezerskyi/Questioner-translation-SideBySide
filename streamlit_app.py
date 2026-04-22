@@ -34,6 +34,25 @@ def _iter_block_items(parent):
             yield ("t", Table(child, parent))
 
 
+def _paragraph_text_with_soft_breaks(paragraph):
+    """
+    Word often keeps options in one paragraph separated by soft line breaks (``w:br``).
+    ``paragraph.text`` joins runs without newlines, which breaks stem vs answer detection.
+    """
+    out = []
+    try:
+        for run in paragraph.runs:
+            for el in run._element:
+                if el.tag == qn("w:t"):
+                    out.append(el.text or "")
+                elif el.tag in (qn("w:br"), qn("w:cr")):
+                    out.append("\n")
+    except Exception:
+        pass
+    s = "".join(out).strip()
+    return s if s else (paragraph.text or "").strip()
+
+
 _RE_DOCX_Q = re.compile(
     r"^([A-Za-z]+\d+[a-zA-Z]*)\s*[:.]\s*(.+)$",
     re.DOTALL,
@@ -101,6 +120,11 @@ def _docx_looks_like_option_paragraph(line, stem_first_line):
         return False
     # Numbered / lettered options: 1. 2) 99. a)
     if re.match(r"^(\d+|[a-zA-Z])\s*[\).:]\s+\S", s):
+        return True
+    # ``1  Text`` or ``1 Text`` (grid / statement lists without dot)
+    if re.match(r"^\d{1,3}\s+\S", s):
+        return True
+    if re.match(r"^[\u2022\u2023\u25cf\u25cb\u2219\-\*]\s*\S", s):
         return True
     if s.startswith("["):
         return True
@@ -178,6 +202,22 @@ def _insert_newline_between_show_blocks(text):
     return show_pat.sub(repl, text)
 
 
+def _table_row_label_text(row):
+    """Prefer col2 label; if empty try further columns or col0 when it is not a numeric code."""
+    if not row.cells:
+        return ""
+    cols = [_cell_text_preserve_line_breaks(c) for c in row.cells]
+    code0 = cols[0].strip() if cols else ""
+    if len(cols) > 1 and cols[1].strip():
+        return _insert_newline_between_show_blocks(cols[1])
+    for c in cols[2:]:
+        if c.strip():
+            return _insert_newline_between_show_blocks(c)
+    if code0 and not re.match(r"^[\d\-]+$", code0):
+        return _insert_newline_between_show_blocks(cols[0])
+    return ""
+
+
 def _docx_table_to_answers(qid, table):
     """One row per answer; first column may be empty in some script tables — use row index."""
     answers = []
@@ -185,13 +225,7 @@ def _docx_table_to_answers(qid, table):
         if not row.cells:
             continue
         code = row.cells[0].text.strip()
-        label = (
-            _insert_newline_between_show_blocks(
-                _cell_text_preserve_line_breaks(row.cells[1])
-            )
-            if len(row.cells) > 1
-            else ""
-        )
+        label = _table_row_label_text(row)
         if not code and not label:
             continue
         if ri == 0 and code.lower() in ("code", "#", "no", "no.", "№") and re.search(
@@ -220,11 +254,52 @@ def _expand_buffer_paragraphs(texts, header):
         if len(parts) <= 1:
             out.append(t)
             continue
-        if header and _docx_looks_like_option_paragraph(parts[0], header):
+        ref = (header or "").strip()
+        if ref and _docx_stem_looks_complete(ref):
+            if _docx_looks_like_option_paragraph(parts[0], ref):
+                out.extend(parts)
+                continue
+        if len(parts) >= 3 and sum(1 for p in parts if _docx_looks_like_option_paragraph(p, ref or parts[0])) >= 2:
             out.extend(parts)
-        else:
-            out.append(t)
+            continue
+        out.append(t)
     return out
+
+
+def _split_stem_tail_after_question_mark(blob, header):
+    """
+    Last resort when one paragraph still holds ``stem + options`` without newlines
+    (no ``w:br`` in source): split after the first ``?`` and optionally split ``tail``
+    on semicolons or numbered segments.
+    """
+    blob = (blob or "").strip()
+    if not blob or "\n" in blob:
+        return None
+    full = ((header or "").strip() + "\n" + blob).strip() if (header or "").strip() else blob
+    if "?" not in full:
+        return None
+    qix = full.rfind("?")
+    stem = full[: qix + 1].strip()
+    tail = full[qix + 1 :].strip()
+    if len(tail) < 18:
+        return None
+    opts = []
+    if ";" in tail and tail.count(";") >= 2:
+        opts = [x.strip() for x in tail.split(";") if x.strip()]
+    else:
+        nums = list(re.finditer(r"(?:^|\n)\s*(\d{1,3})[\).\s]\s*", tail))
+        if len(nums) >= 2:
+            cuts = [m.start() for m in nums]
+            for i, start in enumerate(cuts):
+                end = cuts[i + 1] if i + 1 < len(cuts) else len(tail)
+                chunk = tail[start:end].strip()
+                if chunk:
+                    opts.append(chunk)
+        else:
+            opts = [tail]
+    if not opts:
+        return None
+    return [stem] + opts
 
 
 def _docx_flush_paragraph_buffer_core(current_q, texts):
@@ -238,6 +313,22 @@ def _docx_flush_paragraph_buffer_core(current_q, texts):
         return
     if len(texts) == 1:
         only = texts[0]
+        if "\n" in only:
+            sub = [x.strip() for x in only.split("\n") if x.strip()]
+            if len(sub) >= 2:
+                _docx_flush_paragraph_buffer_core(current_q, sub)
+                return
+        split_blob = _split_stem_tail_after_question_mark(only, header)
+        if split_blob and len(split_blob) >= 2:
+            current_q["text"] = split_blob[0]
+            for j, ot in enumerate(split_blob[1:], 1):
+                current_q["answers"].append({
+                    "id": f"{current_q['id']}_{j}",
+                    "role": "row",
+                    "number": str(j),
+                    "text": ot,
+                })
+            return
         if _docx_looks_like_option_paragraph(only, header):
             current_q["answers"].append({
                 "id": f"{current_q['id']}_1",
@@ -294,8 +385,6 @@ def _docx_flush_question_buffer(current_q, buf):
         for k, d in buf:
             if k == "p" and not _docx_is_meta_line(d):
                 stem_parts.append(d.strip())
-            elif k == "t":
-                break
         para_stem = "\n".join(stem_parts).strip()
         header = (current_q.get("text") or "").strip()
         if para_stem:
@@ -348,7 +437,7 @@ def parse_docx(file_bytes):
 
         for kind, item in _iter_block_items(doc):
             if kind == "p":
-                t = item.text.strip()
+                t = _paragraph_text_with_soft_breaks(item).strip()
                 if not t:
                     continue
 
@@ -739,6 +828,7 @@ def _set_cell_multiline_text(cell, text, font_pt=9):
         cell.add_paragraph(ln)
     for para in cell.paragraphs:
         for run in para.runs:
+            run.bold = False
             run.font.size = Pt(font_pt)
 
 
@@ -790,8 +880,12 @@ def _add_nested_answer_table(cell, answers, use_primary_text, label_column_width
         row.cells[0].text = num
         for para in row.cells[0].paragraphs:
             for run in para.runs:
+                run.bold = False
                 run.font.size = Pt(9)
         _set_cell_multiline_text(row.cells[1], label, font_pt=9)
+        for para in row.cells[1].paragraphs:
+            for run in para.runs:
+                run.bold = False
         row.cells[0].width = idx_w
         row.cells[1].width = lbl_w
 
