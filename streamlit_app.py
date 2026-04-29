@@ -796,8 +796,7 @@ st.title("Survey Bilingual — XML → DOCX")
 st.markdown(
     "Upload a single survey XML that contains both languages. "
     "Below, set the column headers for the generated DOCX. "
-    "**For the right-hand column, enter the name of the translation language exactly as it appears in your file** "
-    "(for example, how it is labelled in the source or filename). "
+    "**For the right-hand column, enter the name of the translation language exactly as it appears in your file.** "
     "The output is a two-column document for side-by-side review."
 )
 
