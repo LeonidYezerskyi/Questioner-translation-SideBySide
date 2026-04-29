@@ -1,8 +1,11 @@
-"""Bilingual survey generator: two XML exports (same schema) -> one DOCX.
+"""Bilingual survey generator: one combined XML -> one DOCX.
 
 Run: ``streamlit run survey_xml_bilingual.py``
 
-Expects the same structure as ``parse_xml`` in ``page copy.tsx`` (``<survey>`` / ``<section>`` / questions with ``id``).
+Expects ``<survey>`` / ``<section>`` / questions with ``id``. Question and answer
+text may be split as ``<english>`` / ``<translated>`` under ``<paragraph>`` (and
+``<sectiontitle>`` for section headers). Same layout as ``parse_xml`` in
+``page copy.tsx``, plus optional bilingual child tags.
 """
 import streamlit as st
 import xml.etree.ElementTree as ET
@@ -30,22 +33,14 @@ def _fpt(n: float) -> Pt:
 NON_QUESTION_KEYS = {
     'id', 'title', 'current_version_id', 'current_version_number',
     'next_version_id', 'num_of_versions', 'plotly_export_format',
-    'previous_version_id', 'regenerate_collection', 'section_type', 'methodology'
+    'previous_version_id', 'regenerate_collection', 'section_type', 'methodology',
+    'sectiontitle',
 }
 
-def extract_title(elem):
-    """Extract question text from <title> or <textblockcontent>."""
-    title = elem.find('title')
-    if title is not None:
-        p = title.find('paragraph')
-        if p is not None:
-            return get_full_text(p)
-    tbc = elem.find('textblockcontent')
-    if tbc is not None:
-        p = tbc.find('paragraph')
-        if p is not None:
-            return get_full_text(p)
-    return ''
+# Element names for first / second column in combined XML exports (content language may vary).
+TEXT_ROLE_PRIMARY = 'english'
+TEXT_ROLE_SECONDARY = 'translated'
+
 
 def get_full_text(elem):
     """Recursively get all text from element."""
@@ -58,8 +53,58 @@ def get_full_text(elem):
             parts.append(child.tail.strip())
     return ' '.join(p for p in parts if p)
 
-def extract_answers(elem):
-    """Extract all answer rows from any answers structure."""
+
+def _paragraph_text_for_role(p, role):
+    """One ``<paragraph>``: bilingual ``<english>``/``<translated>`` or legacy plain text."""
+    en_n = p.find(TEXT_ROLE_PRIMARY)
+    tr_n = p.find(TEXT_ROLE_SECONDARY)
+    if en_n is not None or tr_n is not None:
+        target = en_n if role == TEXT_ROLE_PRIMARY else tr_n
+        return get_full_text(target).strip() if target is not None else ''
+    if role == TEXT_ROLE_PRIMARY:
+        return get_full_text(p).strip()
+    return ''
+
+
+def _join_paragraphs_under(host, role):
+    """Join all ``<paragraph>`` texts under ``host`` (e.g. ``<title>``)."""
+    if host is None:
+        return ''
+    parts = [_paragraph_text_for_role(p, role) for p in host.findall('paragraph')]
+    return ' '.join(x for x in parts if x).strip()
+
+
+def extract_body_text(elem, role):
+    """Question or textblock body from ``<title>`` or ``<textblockcontent>`` for one column."""
+    title = elem.find('title')
+    if title is not None:
+        t = _join_paragraphs_under(title, role)
+        if t:
+            return t
+    tbc = elem.find('textblockcontent')
+    if tbc is not None:
+        return _join_paragraphs_under(tbc, role)
+    return ''
+
+
+def extract_title(elem):
+    """Extract question text (primary column only; legacy single-language XML)."""
+    return extract_body_text(elem, TEXT_ROLE_PRIMARY)
+
+
+def extract_answer_item_text(item, role):
+    """Label text for a ``row`` / ``grow`` / ``gcol`` for one column."""
+    parts = [_paragraph_text_for_role(p, role) for p in item.findall('paragraph')]
+    joined = ' '.join(x for x in parts if x).strip()
+    if joined:
+        return joined
+    if role == TEXT_ROLE_PRIMARY:
+        return get_full_text(item).strip()
+    return ''
+
+
+def extract_answers(elem, role=TEXT_ROLE_PRIMARY):
+    """Extract all answer rows from any answers structure for one language column."""
     answers = []
     answers_node = elem.find('answers')
     if answers_node is None:
@@ -68,7 +113,7 @@ def extract_answers(elem):
             answers.append({
                 'id': row.get('id', ''),
                 'role': 'row',
-                'text': get_full_text(row)
+                'text': extract_answer_item_text(row, role)
             })
         return answers
 
@@ -81,9 +126,24 @@ def extract_answers(elem):
                 answers.append({
                     'id': item.get('id', ''),
                     'role': child_type,
-                    'text': get_full_text(item)
+                    'text': extract_answer_item_text(item, role)
                 })
     return answers
+
+
+def section_heading_for_role(section, role):
+    """Section banner from ``<sectiontitle>`` bilingual pair or ``section[@title]``."""
+    st = section.find('sectiontitle')
+    if st is not None:
+        en_n = st.find(TEXT_ROLE_PRIMARY)
+        tr_n = st.find(TEXT_ROLE_SECONDARY)
+        if en_n is not None or tr_n is not None:
+            target = en_n if role == TEXT_ROLE_PRIMARY else tr_n
+            if target is not None:
+                t = get_full_text(target).strip()
+                if t:
+                    return t
+    return (section.get('title') or section.get('id') or '').strip()
 
 _INTRO_SUFFIX = "_intro"
 _SCRIPT_QID_IN_BODY = re.compile(r"^([A-Za-z]+\d*(?:\.[0-9]+)*)\s*:\s")
@@ -152,14 +212,16 @@ def _flush_pending_script_as_textblock(items, section_id, pending):
     })
 
 
-def parse_xml(xml_bytes):
-    """Parse XML bytes into normalized list of items."""
+def parse_xml(xml_bytes, text_role=TEXT_ROLE_PRIMARY):
+    """Parse XML bytes into normalized list of items for one column (``english`` or ``translated``)."""
     root = ET.fromstring(xml_bytes)
     items = []
 
     for section in root.findall('.//section'):
         section_id = section.get('id', '')
-        section_title = section.get('title', section_id)
+        section_title = section_heading_for_role(section, text_role)
+        if not section_title:
+            section_title = section_id
         pending_script = None
 
         items.append({
@@ -179,18 +241,19 @@ def parse_xml(xml_bytes):
 
             if tag == "textblock":
                 tid = (child.get("id") or "").strip()
-                body = extract_title(child).strip()
-                hint = _textblock_script_target_qid(tid, body)
+                body_primary = extract_body_text(child, TEXT_ROLE_PRIMARY).strip()
+                body_col = extract_body_text(child, text_role).strip()
+                hint = _textblock_script_target_qid(tid, body_primary)
                 if hint:
                     if pending_script:
                         _flush_pending_script_as_textblock(items, section_id, pending_script)
-                    pending_script = {"qid": hint, "text": body}
+                    pending_script = {"qid": hint, "text": body_col}
                 else:
                     items.append({
                         "id": tid or f"{section_id}_tb_{len(items)}",
                         "type": "textblock",
                         "sectionId": section_id,
-                        "text": body,
+                        "text": body_col,
                         "answers": [],
                         "script_header": "",
                         "notes": [],
@@ -215,8 +278,8 @@ def parse_xml(xml_bytes):
                 "id": q_id,
                 "type": tag,
                 "sectionId": section_id,
-                "text": extract_title(child),
-                "answers": extract_answers(child),
+                "text": extract_body_text(child, text_role),
+                "answers": extract_answers(child, text_role),
                 "script_header": script_header,
                 "notes": notes,
             })
@@ -731,24 +794,27 @@ def generate_docx(merged, primary_label, secondary_label):
 st.set_page_config(page_title="Survey Bilingual (XML)", layout="centered")
 st.title("Survey Bilingual — XML → DOCX")
 st.markdown(
-    "Upload **two XML** files with the same structure (survey export): first language as the **primary** "
-    "column, second as the **translation** column. Output is a two-column DOCX for side-by-side review."
+    "Upload **one** survey XML where copy is split into **`<english>`** and **`<translated>`** "
+    "(under ``<paragraph>``, and ``<sectiontitle>`` for section headers). "
+    "Column labels below are labels only — any language may appear in each column. "
+    "Output is a two-column DOCX for side-by-side review."
 )
 
 c1, c2 = st.columns(2)
 with c1:
     primary_label = st.text_input("Left column label", value="English")
-    primary_file = st.file_uploader("XML (primary language)", type=["xml"])
 with c2:
     secondary_label = st.text_input("Right column label", value="Translation")
-    secondary_file = st.file_uploader("XML (translation)", type=["xml"])
 
-if primary_file and secondary_file:
+combined_file = st.file_uploader("Combined bilingual XML", type=["xml"])
+
+if combined_file:
     if st.button("Generate bilingual DOCX", type="primary"):
         with st.spinner("Parsing XML…"):
             try:
-                primary_items = parse_xml(primary_file.read())
-                secondary_items = parse_xml(secondary_file.read())
+                raw = combined_file.read()
+                primary_items = parse_xml(raw, TEXT_ROLE_PRIMARY)
+                secondary_items = parse_xml(raw, TEXT_ROLE_SECONDARY)
                 merged = merge(primary_items, secondary_items)
                 st.success(f"Merged {len(merged)} items")
                 with st.expander("Preview (first 8)"):
@@ -765,4 +831,4 @@ if primary_file and secondary_file:
                 st.error(str(e))
                 st.exception(e)
 else:
-    st.info("Upload both XML files to continue.")
+    st.info("Upload a combined bilingual XML file to continue.")
