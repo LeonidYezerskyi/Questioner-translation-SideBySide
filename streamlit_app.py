@@ -794,10 +794,11 @@ def generate_docx(merged, primary_label, secondary_label):
 st.set_page_config(page_title="Survey Bilingual (XML)", layout="centered")
 st.title("Survey Bilingual — XML → DOCX")
 st.markdown(
-    "Upload **one** survey XML where copy is split into **`<english>`** and **`<translated>`** "
-    "(under ``<paragraph>``, and ``<sectiontitle>`` for section headers). "
-    "Column labels below are labels only — any language may appear in each column. "
-    "Output is a two-column DOCX for side-by-side review."
+    "Upload a single survey XML that contains both languages. "
+    "Below, set the column headers for the generated DOCX. "
+    "**For the right-hand column, enter the name of the translation language exactly as it appears in your file** "
+    "(for example, how it is labelled in the source or filename). "
+    "The output is a two-column document for side-by-side review."
 )
 
 c1, c2 = st.columns(2)
